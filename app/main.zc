@@ -1,0 +1,58 @@
+// ZenRTOS Application in Zen-C
+// Target: STM32L476RG (NUCLEO-L476RG)
+
+import "rtos.h" as rtos;
+import "stm32l476.h" as bsp;
+
+def STACK_SIZE_WORDS = 256;
+
+let stack_led: u32[256];
+let stack_sensor: u32[256];
+let stack_telemetry: u32[256];
+
+let g_sensor_mutex: rtos::rtos_mutex_t;
+let g_shared_temperature: u32 = 25;
+
+fn task_led_blink(_arg: void*) {
+    bsp::bsp_init_led();
+    while true {
+        bsp::bsp_toggle_led();
+        rtos::rtos_delay(500);
+    }
+}
+
+fn task_sensor_poll(_arg: void*) {
+    while true {
+        rtos::rtos_mutex_lock(&g_sensor_mutex, 100);
+        g_shared_temperature = g_shared_temperature + 1;
+        if g_shared_temperature > 45 {
+            g_shared_temperature = 20;
+        }
+        rtos::rtos_mutex_unlock(&g_sensor_mutex);
+        rtos::rtos_delay(200);
+    }
+}
+
+fn task_telemetry_report(_arg: void*) {
+    while true {
+        rtos::rtos_mutex_lock(&g_sensor_mutex, 100);
+        let _temp: u32 = g_shared_temperature;
+        rtos::rtos_mutex_unlock(&g_sensor_mutex);
+        rtos::rtos_delay(1000);
+    }
+}
+
+fn main() -> int {
+    rtos::rtos_init();
+    rtos::rtos_mutex_init(&g_sensor_mutex);
+
+    // Create tasks: Priority 5 (Sensor), Priority 8 (Telemetry), Priority 10 (LED)
+    rtos::rtos_task_create(task_sensor_poll, NULL, 5, &stack_sensor[0], STACK_SIZE_WORDS, "Sensor");
+    rtos::rtos_task_create(task_telemetry_report, NULL, 8, &stack_telemetry[0], STACK_SIZE_WORDS, "Telemetry");
+    rtos::rtos_task_create(task_led_blink, NULL, 10, &stack_led[0], STACK_SIZE_WORDS, "BlinkLED");
+
+    // Start RTOS on STM32L476: 4 MHz default MSI clock, 1000 Hz SysTick (1 ms)
+    rtos::rtos_start(4000000, 1000);
+
+    return 0;
+}

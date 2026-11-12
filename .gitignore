@@ -1,0 +1,14 @@
+# Build outputs
+build/
+app/main_zc.c
+*.elf
+*.bin
+*.o
+
+# Editor files
+.DS_Store
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
