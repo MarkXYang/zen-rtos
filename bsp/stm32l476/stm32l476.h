@@ -69,11 +69,13 @@ static inline bool bsp_get_led(void) {
     return (GPIOA_ODR & (1UL << 5)) != 0;
 }
 
-// Interrupt-driven 128-byte UART RX Ring Buffer
+// Interrupt-driven 128-byte UART RX Ring Buffer & Shell State
 #define UART_RX_BUF_SIZE      128U
 static volatile char          g_uart_rx_buf[UART_RX_BUF_SIZE];
 static volatile uint32_t      g_uart_rx_head = 0;
 static volatile uint32_t      g_uart_rx_tail = 0;
+static char                   g_shell_cmd_buf[64];
+static volatile uint32_t      g_shell_cmd_len = 0;
 
 void USART2_IRQHandler(void) {
     uint32_t isr = USART2_ISR;
@@ -192,7 +194,7 @@ static inline const char *bsp_trace_type_str(uint8_t type) {
     }
 }
 
-static inline void bsp_debug_dump_status(uint32_t shared_temp) {
+static inline void bsp_debug_dump_status_table(uint32_t shared_temp) {
     rtos_stats_t stats;
     rtos_get_stats(&stats);
 
@@ -216,7 +218,6 @@ static inline void bsp_debug_dump_status(uint32_t shared_temp) {
         bsp_uart_putdec(t->id);
         bsp_uart_puts("  ");
         bsp_uart_puts(t->name);
-        // Pad name to 10 chars
         int len = 0;
         const char *p = t->name;
         while (*p++) len++;
@@ -236,6 +237,14 @@ static inline void bsp_debug_dump_status(uint32_t shared_temp) {
         bsp_uart_putdec(t->stack_size * 4U);
         bsp_uart_puts("B\n");
     }
+}
+
+// Called by background Telemetry task: pauses automatically while user is typing in shell!
+static inline void bsp_debug_dump_status(uint32_t shared_temp) {
+    if (g_shell_cmd_len > 0) {
+        return; // User is actively typing a command; do not interrupt their line!
+    }
+    bsp_debug_dump_status_table(shared_temp);
     bsp_uart_puts("zensh> ");
 }
 
@@ -243,9 +252,14 @@ static inline void bsp_debug_dump_status(uint32_t shared_temp) {
 // Freestanding String Helpers & ZenRTOS Interactive Shell (zensh>)
 // -------------------------------------------------------------------------
 
+static inline char bsp_tolower(char c) {
+    if (c >= 'A' && c <= 'Z') return (char)(c + ('a' - 'A'));
+    return c;
+}
+
 static inline bool bsp_streq(const char *a, const char *b) {
     while (*a && *b) {
-        if (*a != *b) return false;
+        if (bsp_tolower(*a) != bsp_tolower(*b)) return false;
         a++;
         b++;
     }
@@ -260,13 +274,19 @@ static inline void bsp_shell_banner(void) {
     bsp_uart_puts("\n========================================================\n");
     bsp_uart_puts("  ZenRTOS Interactive Shell (zensh v1.2) - STM32L476RG  \n");
     bsp_uart_puts("  Type 'help' for available RTOS inspection commands.   \n");
+    bsp_uart_puts("  Type 'log off' to stop periodic telemetry printout.   \n");
     bsp_uart_puts("========================================================\n");
     bsp_shell_prompt();
 }
 
-static inline void bsp_shell_exec(const char *cmd, rtos_queue_t *sensor_q,
+static inline void bsp_shell_exec(const char *raw_cmd, rtos_queue_t *sensor_q,
                                   uint32_t latest_temp, volatile uint32_t *led_auto_blink,
                                   volatile uint32_t *telemetry_log_on) {
+    // Skip leading whitespace
+    const char *cmd = raw_cmd;
+    while (*cmd == ' ' || *cmd == '\t') {
+        cmd++;
+    }
     if (cmd[0] == '\0') {
         return;
     }
@@ -281,13 +301,13 @@ static inline void bsp_shell_exec(const char *cmd, rtos_queue_t *sensor_q,
         bsp_uart_puts("  led on|off      - Turn PA5 green LED ON or OFF (manual override)\n");
         bsp_uart_puts("  led toggle      - Toggle PA5 green LED state\n");
         bsp_uart_puts("  led blink       - Resume automatic 1 Hz RTOS LED blinking task\n");
-        bsp_uart_puts("  log on|off      - Enable/disable periodic 1s telemetry console stream\n");
+        bsp_uart_puts("  log on|off      - Enable/disable periodic telemetry console stream\n");
         bsp_uart_puts("  fault           - Show Cortex-M4 post-mortem HardFault register record\n");
         bsp_uart_puts("  uptime          - Show system tick counter and uptime\n");
         bsp_uart_puts("  clear           - Clear terminal screen\n");
         bsp_uart_puts("  reboot          - Trigger Cortex-M4 software system reset\n");
     } else if (bsp_streq(cmd, "ps") || bsp_streq(cmd, "top")) {
-        bsp_debug_dump_status(latest_temp);
+        bsp_debug_dump_status_table(latest_temp);
     } else if (bsp_streq(cmd, "trace")) {
         const rtos_trace_event_t *buf = NULL;
         uint32_t head = 0;
@@ -354,28 +374,28 @@ static inline void bsp_shell_exec(const char *cmd, rtos_queue_t *sensor_q,
             bsp_uart_putdec(tot_b);
             bsp_uart_puts("B\n");
         }
-    } else if (bsp_streq(cmd, "led on")) {
+    } else if (bsp_streq(cmd, "led on") || bsp_streq(cmd, "ledon")) {
         *led_auto_blink = 0;
         bsp_set_led(true);
         bsp_uart_puts("LED (PA5) set to ON (manual mode).\n");
-    } else if (bsp_streq(cmd, "led off")) {
+    } else if (bsp_streq(cmd, "led off") || bsp_streq(cmd, "ledoff")) {
         *led_auto_blink = 0;
         bsp_set_led(false);
         bsp_uart_puts("LED (PA5) set to OFF (manual mode).\n");
-    } else if (bsp_streq(cmd, "led toggle")) {
+    } else if (bsp_streq(cmd, "led toggle") || bsp_streq(cmd, "ledtoggle")) {
         *led_auto_blink = 0;
         bsp_toggle_led();
         bsp_uart_puts("LED (PA5) toggled -> ");
         bsp_uart_puts(bsp_get_led() ? "ON\n" : "OFF\n");
-    } else if (bsp_streq(cmd, "led blink")) {
+    } else if (bsp_streq(cmd, "led blink") || bsp_streq(cmd, "ledblink")) {
         *led_auto_blink = 1;
         bsp_uart_puts("LED (PA5) returned to automatic 1 Hz RTOS blink task.\n");
-    } else if (bsp_streq(cmd, "log on")) {
+    } else if (bsp_streq(cmd, "log on") || bsp_streq(cmd, "logon") || bsp_streq(cmd, "log 1")) {
         *telemetry_log_on = 1;
-        bsp_uart_puts("Periodic 1s telemetry broadcast ENABLED.\n");
-    } else if (bsp_streq(cmd, "log off")) {
+        bsp_uart_puts("Periodic telemetry broadcast ENABLED.\n");
+    } else if (bsp_streq(cmd, "log off") || bsp_streq(cmd, "logoff") || bsp_streq(cmd, "log 0") || bsp_streq(cmd, "quiet") || bsp_streq(cmd, "stop")) {
         *telemetry_log_on = 0;
-        bsp_uart_puts("Periodic 1s telemetry broadcast DISABLED.\n");
+        bsp_uart_puts("Periodic telemetry broadcast DISABLED.\n");
     } else if (bsp_streq(cmd, "fault")) {
         bsp_uart_puts("Fault Status: ");
         bsp_uart_puts(g_fault_info.active ? "ACTIVE FAULT RECORDED\n" : "NONE (Healthy)\n");
@@ -395,9 +415,9 @@ static inline void bsp_shell_exec(const char *cmd, rtos_queue_t *sensor_q,
         bsp_uart_puts(" s (");
         bsp_uart_putdec(ticks);
         bsp_uart_puts(" ticks)\n");
-    } else if (bsp_streq(cmd, "clear")) {
+    } else if (bsp_streq(cmd, "clear") || bsp_streq(cmd, "cls")) {
         bsp_uart_puts("\033[2J\033[H");
-    } else if (bsp_streq(cmd, "reboot")) {
+    } else if (bsp_streq(cmd, "reboot") || bsp_streq(cmd, "reset")) {
         bsp_uart_puts("Rebooting STM32L476RG...\n");
         SCB_AIRCR = 0x05FA0004UL;
         while (1) {}
@@ -411,30 +431,57 @@ static inline void bsp_shell_exec(const char *cmd, rtos_queue_t *sensor_q,
 static inline void bsp_shell_poll(rtos_queue_t *sensor_q, uint32_t latest_temp,
                                   volatile uint32_t *led_auto_blink,
                                   volatile uint32_t *telemetry_log_on) {
-    static char cmd_buf[64];
-    static uint32_t cmd_len = 0;
+    static uint8_t esc_state = 0;
+    static char last_eol = 0;
     char c = 0;
 
     while (bsp_uart_getc(&c)) {
+        // Filter out ANSI escape sequences (e.g. arrow keys \033[A .. \033[D)
+        if (esc_state == 1) {
+            esc_state = (c == '[') ? 2 : 0;
+            continue;
+        } else if (esc_state == 2) {
+            if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '~') {
+                esc_state = 0;
+            }
+            continue;
+        }
+        if (c == 0x1B) {
+            esc_state = 1;
+            continue;
+        }
+
+        // Handle CRLF (\r\n) without double-executing empty line
+        if ((c == '\n' && last_eol == '\r') || (c == '\r' && last_eol == '\n')) {
+            last_eol = 0;
+            continue;
+        }
+
         if (c == '\r' || c == '\n') {
+            last_eol = c;
             bsp_uart_puts("\n");
-            cmd_buf[cmd_len] = '\0';
-            // Trim trailing spaces
-            while (cmd_len > 0 && cmd_buf[cmd_len - 1] == ' ') {
-                cmd_buf[--cmd_len] = '\0';
+            g_shell_cmd_buf[g_shell_cmd_len] = '\0';
+            while (g_shell_cmd_len > 0 &&
+                   (g_shell_cmd_buf[g_shell_cmd_len - 1] == ' ' ||
+                    g_shell_cmd_buf[g_shell_cmd_len - 1] == '\t')) {
+                g_shell_cmd_buf[--g_shell_cmd_len] = '\0';
             }
-            bsp_shell_exec(cmd_buf, sensor_q, latest_temp, led_auto_blink, telemetry_log_on);
-            cmd_len = 0;
+            bsp_shell_exec(g_shell_cmd_buf, sensor_q, latest_temp,
+                           led_auto_blink, telemetry_log_on);
+            g_shell_cmd_len = 0;
             bsp_shell_prompt();
-        } else if (c == '\b' || c == 0x7F) {
-            if (cmd_len > 0) {
-                cmd_len--;
-                bsp_uart_puts("\b \b");
-            }
-        } else if (c >= 0x20 && c < 0x7F) {
-            if (cmd_len < sizeof(cmd_buf) - 1) {
-                cmd_buf[cmd_len++] = c;
-                bsp_uart_putc(c);
+        } else {
+            last_eol = 0;
+            if (c == '\b' || c == 0x7F) {
+                if (g_shell_cmd_len > 0) {
+                    g_shell_cmd_len--;
+                    bsp_uart_puts("\b \b");
+                }
+            } else if (c >= 0x20 && c < 0x7F) {
+                if (g_shell_cmd_len < sizeof(g_shell_cmd_buf) - 1) {
+                    g_shell_cmd_buf[g_shell_cmd_len++] = c;
+                    bsp_uart_putc(c);
+                }
             }
         }
     }

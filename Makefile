@@ -25,7 +25,7 @@ LDFLAGS_ARM   ?= --target=$(TARGET_TRIPLE) -mcpu=$(CPU) -mthumb \
 
 BUILD_DIR     := build
 
-.PHONY: all build test zenc clean
+.PHONY: all build test zenc flash shell clean
 
 all: build
 
@@ -65,6 +65,13 @@ $(BUILD_DIR)/zen_rtos.elf: kernel/rtos.c \
 
 $(BUILD_DIR)/zen_rtos.bin: $(BUILD_DIR)/zen_rtos.elf
 	$(LLVM_OBJCOPY) -O binary $< $@
+
+flash: build
+	openocd -f interface/stlink.cfg -f target/stm32l4x.cfg \
+		-c "program $(BUILD_DIR)/zen_rtos.elf verify reset exit"
+
+shell:
+	python3 -m serial.tools.miniterm --eol CR /dev/ttyACM0 115200
 
 clean:
 	rm -rf $(BUILD_DIR) app/main_zc.c
