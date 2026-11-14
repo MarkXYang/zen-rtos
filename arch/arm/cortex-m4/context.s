@@ -43,3 +43,28 @@ rtos_start_first_task:
     cpsie i                 /* Enable interrupts */
     pop   {r0-r3, r12, lr}  /* Pop hardware exception frame */
     pop   {pc}              /* Jump directly into task function */
+
+/* -------------------------------------------------------------------------
+ * Cortex-M4 Fault Analyzer Entry (HardFault / MemManage / BusFault / UsageFault)
+ * Determines whether fault occurred on MSP or PSP (EXC_RETURN bit 2 in LR)
+ * and passes the stacked exception frame pointer to rtos_fault_capture(sp).
+ * ------------------------------------------------------------------------- */
+.global HardFault_Handler
+.type HardFault_Handler, %function
+.global MemManage_Handler
+.type MemManage_Handler, %function
+.global BusFault_Handler
+.type BusFault_Handler, %function
+.global UsageFault_Handler
+.type UsageFault_Handler, %function
+
+HardFault_Handler:
+MemManage_Handler:
+BusFault_Handler:
+UsageFault_Handler:
+    cpsid i
+    tst   lr, #4
+    ite   eq
+    mrseq r0, msp
+    mrsne r0, psp
+    b     rtos_fault_capture

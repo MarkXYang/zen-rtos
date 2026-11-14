@@ -39,8 +39,12 @@ void task_telemetry_report(void *arg) {
     while (1) {
         rtos_mutex_lock(&g_sensor_mutex, 100);
         uint32_t temp = g_shared_temperature;
-        (void)temp;
         rtos_mutex_unlock(&g_sensor_mutex);
+
+        // Verify stack canaries and emit live debug telemetry over USART2 (ST-LINK VCP)
+        uint32_t overflow_id = rtos_check_stack_overflow();
+        RTOS_ASSERT(overflow_id == 0);
+        bsp_debug_dump_status(temp);
 
         // Periodic broadcast every 1 second
         rtos_delay(1000);
@@ -48,6 +52,9 @@ void task_telemetry_report(void *arg) {
 }
 
 int main(void) {
+    bsp_init_uart(4000000, 115200);
+    bsp_uart_puts("\n[ZenRTOS] Booting on STM32L476RG (4 MHz MSI, 115200 8N1)...\n");
+
     rtos_init();
     rtos_mutex_init(&g_sensor_mutex);
 
