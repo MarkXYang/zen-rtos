@@ -13,6 +13,8 @@ TARGET_TRIPLE ?= arm-none-eabi
 CPU           ?= cortex-m4
 CFLAGS_ARM    ?= --target=$(TARGET_TRIPLE) -mcpu=$(CPU) -mthumb \
                  -mfloat-abi=soft -O2 -Wall -Wextra -ffreestanding \
+                 -Wno-unused-parameter -Wno-unused-variable -Wno-unused-function \
+                 -DZC_FUNC= -DZC_GLOBAL= \
                  -Ikernel/include -Ibsp/stm32l476 -Iarch/arm/cortex-m4 \
                  -fdata-sections -ffunction-sections
 
@@ -39,23 +41,25 @@ $(BUILD_DIR)/test_scheduler: tests/host/test_scheduler.c kernel/rtos.c
 	$(CC_HOST) $(CFLAGS_HOST) $^ -o $@
 
 # ----------------------------------------------------------------------
-# Target 2: Zen-C Transpilation
+# Target 2: Zen-C Freestanding Transpilation (app/main.zc -> app/main_zc.c)
 # ----------------------------------------------------------------------
-zenc: app/main.zc
-	@echo "--- Transpiling Zen-C to C ---"
-	$(ZC) transpile app/main.zc -Ikernel/include -Ibsp/stm32l476 -o app/main_zc.c
+zenc: app/main_zc.c
+
+app/main_zc.c: app/main.zc kernel/include/rtos.h bsp/stm32l476/stm32l476.h
+	@echo "--- Transpiling Zen-C (--freestanding) to C ---"
+	$(ZC) transpile --freestanding app/main.zc -Ikernel/include -Ibsp/stm32l476 -o app/main_zc.c
 
 # ----------------------------------------------------------------------
-# Target 3: STM32L476 Bare-Metal Binary Build
+# Target 3: STM32L476 Bare-Metal Binary Build (directly from app/main.zc!)
 # ----------------------------------------------------------------------
 build: $(BUILD_DIR)/zen_rtos.bin $(BUILD_DIR)/zen_rtos.elf
 	@echo "--- STM32L476 ZenRTOS Build Complete ---"
 	@ls -lh $(BUILD_DIR)/zen_rtos.elf $(BUILD_DIR)/zen_rtos.bin
 
 $(BUILD_DIR)/zen_rtos.elf: kernel/rtos.c \
-                          arch/arm/cortex-m4/context.s \
-                          bsp/stm32l476/startup.s \
-                          app/main.c
+                           arch/arm/cortex-m4/context.s \
+                           bsp/stm32l476/startup.s \
+                           app/main_zc.c
 	@mkdir -p $(BUILD_DIR)
 	$(CLANG) $(CFLAGS_ARM) $(LDFLAGS_ARM) $^ -o $@
 
