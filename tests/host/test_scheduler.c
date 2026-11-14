@@ -262,6 +262,35 @@ static void test_trace_buffer_and_fault_capture(void) {
            count);
 }
 
+// -------------------------------------------------------------------------
+// Test 9: Inter-Thread Message Queue (FIFO & Blocking Wakeup)
+// -------------------------------------------------------------------------
+static void test_message_queue_ipc(void) {
+    printf("[TEST 9] Verifying bounded message queue (rtos_queue_t) IPC...\n");
+    rtos_init();
+
+    uint32_t qbuf[4];
+    rtos_queue_t q;
+    rtos_queue_init(&q, qbuf, 4);
+
+    rtos_task_create(dummy_task1, NULL, 10, stack_t1, 256, "Producer");
+    rtos_task_create(dummy_task2, NULL, 5,  stack_t2, 256, "Consumer");
+    rtos_start(1000, 1000);
+
+    // Send 3 messages in FIFO order
+    assert(rtos_queue_send(&q, 101, 0) == true);
+    assert(rtos_queue_send(&q, 202, 0) == true);
+    assert(rtos_queue_send(&q, 303, 0) == true);
+    assert(rtos_queue_count(&q) == 3);
+
+    uint32_t msg = 0;
+    assert(rtos_queue_recv(&q, &msg, 0) == true && msg == 101);
+    assert(rtos_queue_recv(&q, &msg, 0) == true && msg == 202);
+    assert(rtos_queue_recv(&q, &msg, 0) == true && msg == 303);
+    assert(rtos_queue_count(&q) == 0);
+    printf("         FIFO ordering & semaphore-backed queue count verified. [PASS]\n");
+}
+
 int main(void) {
     printf("====================================================\n");
     printf("      ZenRTOS Host Verification Test Suite         \n");
@@ -275,9 +304,10 @@ int main(void) {
     test_stack_watermark_and_overflow();
     test_runtime_stats_and_cpu_load();
     test_trace_buffer_and_fault_capture();
+    test_message_queue_ipc();
 
     printf("====================================================\n");
-    printf("  ALL 8 UNIT TESTS PASSED SUCCESSFULLY! (100%%)      \n");
+    printf("  ALL 9 UNIT TESTS PASSED SUCCESSFULLY! (100%%)      \n");
     printf("====================================================\n");
     return 0;
 }

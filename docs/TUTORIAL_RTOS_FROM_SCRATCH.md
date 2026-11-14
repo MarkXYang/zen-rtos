@@ -184,44 +184,60 @@ Unlike a semaphore, a **Mutex** (`rtos_mutex_t`) has the concept of **Task Owner
    - Medium-priority tasks ($P = 10$) are prevented from preempting Task L while it holds the lock.
    - As soon as Task L calls `rtos_mutex_unlock()`, its priority is restored to `20` and Task H immediately preempts and acquires the mutex.
 
-### 5.3 Thread-Safe Message Queues (Ring Buffer + Semaphores)
-To pass structured data payloads (such as sensor packets or UART frames) between tasks without shared-variable locks, combine a fixed-size circular ring buffer with two counting semaphores (`items_avail` and `slots_free`):
+### 5.3 Built-In Thread-Safe Message Queues (`rtos_queue_t`)
+ZenRTOS natively supports bounded FIFO message queues (`rtos_queue_t` in `kernel/include/rtos.h` and `kernel/rtos.c`) to pass 32-bit values or struct pointers between tasks without shared-variable race conditions.
 
+#### Kernel Implementation (`kernel/rtos.c`)
 ```c
 typedef struct {
-    uint32_t   *buffer;
-    uint32_t    capacity;
-    uint32_t    head;
-    uint32_t    tail;
-    rtos_sem_t  items_avail;
-    rtos_sem_t  slots_free;
+    uint32_t           *buffer;              // Backing storage array of 32-bit words/messages
+    uint32_t            capacity;            // Maximum number of messages
+    uint32_t            head;                // Write index
+    uint32_t            tail;                // Read index
+    uint32_t            count;               // Current number of queued messages
+    rtos_sem_t          items_avail;         // Signals consumers when data arrives
+    rtos_sem_t          slots_free;          // Signals producers when space frees up
 } rtos_queue_t;
 
-static inline void rtos_queue_init(rtos_queue_t *q, uint32_t *buf, uint32_t capacity) {
-    q->buffer = buf;
+void rtos_queue_init(rtos_queue_t *q, uint32_t *storage_buf, uint32_t capacity) {
+    if (!q || !storage_buf || capacity == 0) return;
+    q->buffer = storage_buf;
     q->capacity = capacity;
     q->head = 0;
     q->tail = 0;
+    q->count = 0;
     rtos_sem_init(&q->items_avail, 0, (int32_t)capacity);
     rtos_sem_init(&q->slots_free, (int32_t)capacity, (int32_t)capacity);
 }
 
-static inline bool rtos_queue_send(rtos_queue_t *q, uint32_t msg, uint32_t timeout) {
-    if (!rtos_sem_wait(&q->slots_free, timeout)) return false;
-    __asm volatile ("cpsid i" : : : "memory");
+bool rtos_queue_send(rtos_queue_t *q, uint32_t msg, uint32_t timeout_ticks) {
+    if (!q || !q->buffer) return false;
+    if (!rtos_sem_wait(&q->slots_free, timeout_ticks)) return false;
+
+    rtos_enter_critical();
     q->buffer[q->head] = msg;
-    q->head = (q->head + 1) % q->capacity;
-    __asm volatile ("cpsie i" : : : "memory");
+    q->head = (q->head + 1U) % q->capacity;
+    q->count++;
+    rtos_trace_record(TRACE_QUEUE_SEND, current_tcb ? (uint8_t)current_tcb->id : 0,
+                      (uint16_t)q->count, msg);
+    rtos_exit_critical();
+
     rtos_sem_signal(&q->items_avail);
     return true;
 }
 
-static inline bool rtos_queue_recv(rtos_queue_t *q, uint32_t *out_msg, uint32_t timeout) {
-    if (!rtos_sem_wait(&q->items_avail, timeout)) return false;
-    __asm volatile ("cpsid i" : : : "memory");
+bool rtos_queue_recv(rtos_queue_t *q, uint32_t *out_msg, uint32_t timeout_ticks) {
+    if (!q || !q->buffer || !out_msg) return false;
+    if (!rtos_sem_wait(&q->items_avail, timeout_ticks)) return false;
+
+    rtos_enter_critical();
     *out_msg = q->buffer[q->tail];
-    q->tail = (q->tail + 1) % q->capacity;
-    __asm volatile ("cpsie i" : : : "memory");
+    q->tail = (q->tail + 1U) % q->capacity;
+    q->count--;
+    rtos_trace_record(TRACE_QUEUE_RECV, current_tcb ? (uint8_t)current_tcb->id : 0,
+                      (uint16_t)q->count, *out_msg);
+    rtos_exit_critical();
+
     rtos_sem_signal(&q->slots_free);
     return true;
 }
@@ -410,19 +426,22 @@ UsageFault_Handler:
 
 ---
 
-## 9. Multi-Tasking Application in Zen-C (`app/main.zc`)
+## 9. Multi-Tasking Producer-Consumer Application in Zen-C (`app/main.zc`)
 
 ```zc
 import "rtos.h" as rtos;
 import "stm32l476.h" as bsp;
 
 def STACK_SIZE_WORDS = 256;
+def SENSOR_QUEUE_CAP = 8;
 
 let stack_led: u32[256];
 let stack_sensor: u32[256];
 let stack_telemetry: u32[256];
 
 let g_sensor_mutex: rtos::rtos_mutex_t;
+let g_sensor_queue: rtos::rtos_queue_t;
+let g_sensor_qbuf: u32[8];
 let g_shared_temperature: u32 = 25;
 
 fn task_led_blink(_arg: void*) {
@@ -440,19 +459,25 @@ fn task_sensor_poll(_arg: void*) {
         if g_shared_temperature > 45 {
             g_shared_temperature = 20;
         }
+        let sample: u32 = g_shared_temperature;
         rtos::rtos_mutex_unlock(&g_sensor_mutex);
+
+        // Send latest sample to Telemetry task via bounded RTOS message queue
+        rtos::rtos_queue_send(&g_sensor_queue, sample, 10);
         rtos::rtos_delay(200);
     }
 }
 
 fn task_telemetry_report(_arg: void*) {
+    let latest_temp: u32 = 25;
     while true {
-        rtos::rtos_mutex_lock(&g_sensor_mutex, 100);
-        let temp: u32 = g_shared_temperature;
-        rtos::rtos_mutex_unlock(&g_sensor_mutex);
+        // Drain all queued sensor samples from the Producer-Consumer queue
+        while rtos::rtos_queue_count(&g_sensor_queue) > 0 {
+            rtos::rtos_queue_recv(&g_sensor_queue, &latest_temp, 10);
+        }
 
         let _overflow_id: u32 = rtos::rtos_check_stack_overflow();
-        bsp::bsp_debug_dump_status(temp);
+        bsp::bsp_debug_dump_status(latest_temp);
         rtos::rtos_delay(1000);
     }
 }
@@ -463,6 +488,7 @@ fn main() -> int {
 
     rtos::rtos_init();
     rtos::rtos_mutex_init(&g_sensor_mutex);
+    rtos::rtos_queue_init(&g_sensor_queue, &g_sensor_qbuf[0], SENSOR_QUEUE_CAP);
 
     rtos::rtos_task_create(task_sensor_poll, NULL, 5, &stack_sensor[0], STACK_SIZE_WORDS, "Sensor");
     rtos::rtos_task_create(task_telemetry_report, NULL, 8, &stack_telemetry[0], STACK_SIZE_WORDS, "Telemetry");

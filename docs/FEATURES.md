@@ -1,7 +1,7 @@
 # ZenRTOS: Feature Summary & Capabilities Document
 ## Preemptive Real-Time Operating System for STM32L476 (ARM Cortex-M4)
 
-**Document Version:** 1.0  
+**Document Version:** 1.2  
 **Target Architecture:** ARM Cortex-M4F (ARMv7E-M)  
 **Primary Target Device:** STM32L476RG (80 MHz, 128 KB SRAM, 1 MB Flash)  
 **Implementation Languages:** Zen-C (`.zc`), Thumb-2 Assembly (`.s`), Freestanding C  
@@ -10,7 +10,7 @@
 
 ## 1. Executive Summary
 
-**ZenRTOS** is an ultra-lightweight, deterministic, preemptive real-time operating system engineered specifically for resource-constrained ARM Cortex-M microcontrollers. Authored in **Zen-C**, it combines the safety and ergonomics of modern systems languages with a zero-overhead footprint (**3.4 KB Flash, ~4 KB RAM**) and deterministic execution bounds.
+**ZenRTOS** is an ultra-lightweight, deterministic, preemptive real-time operating system engineered specifically for resource-constrained ARM Cortex-M microcontrollers. Authored in **Zen-C**, it combines the safety and ergonomics of modern systems languages with a zero-overhead footprint and deterministic execution bounds.
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -23,9 +23,14 @@
 │  └──────────────────┘  └──────────────────┘  └───────────┘  │
 │                                                             │
 │  ┌──────────────────┐  ┌──────────────────┐  ┌───────────┐  │
-│  │  Sleep & Delays  │  │  Mutex + Priority│  │ Counting  │  │
-│  │ (SysTick 1000Hz) │  │   Inheritance    │  │ & Binary  │  │
-│  │ (Non-busy wait)  │  │ (No Inv. Invert) │  │ Semaphore │  │
+│  │  Bounded FIFO    │  │  Mutex + Priority│  │ Counting  │  │
+│  │  Message Queues  │  │   Inheritance    │  │ & Binary  │  │
+│  │ (rtos_queue_t)   │  │ (No Inv. Invert) │  │ Semaphore │  │
+│  └──────────────────┘  └──────────────────┘  └───────────┘  │
+│                                                             │
+│  ┌──────────────────┐  ┌──────────────────┐  ┌───────────┐  │
+│  │ Stack Canary &   │  │ 64-Event Trace   │  │ HardFault │  │
+│  │ High-Watermarks  │  │   Ring Buffer    │  │  Analyzer │  │
 │  └──────────────────┘  └──────────────────┘  └───────────┘  │
 └─────────────────────────────────────────────────────────────┘
 ```
@@ -37,7 +42,6 @@
 ### 2.1 Deterministic $O(1)$ Priority Scheduler
 - **32 Discrete Priority Levels**: Priority `0` (highest / real-time) down to priority `31` (lowest / idle).
 - **Single-Cycle Priority Resolution**: Active ready priorities are tracked in a 32-bit bitmask (`g_ready_bitmap`). Finding the highest-priority ready task executes in **1 CPU cycle** using the Cortex-M hardware `__builtin_ctz` (Count Trailing Zeros) instruction.
-- **Round-Robin for Equal Priorities**: If multiple ready tasks share the same priority level, execution automatically alternates in round-robin fashion upon each SysTick.
 
 ### 2.2 Dual-Stack Hardware Memory Isolation
 - **MSP (Main Stack Pointer)**:
@@ -52,12 +56,9 @@
 - **Zero Interrupt Jitter**: Time-critical peripheral interrupts (UART, SPI, ADC, CAN, Motor Timers) are never delayed by a context switch.
 - Hand-optimized Thumb-2 assembly (`context.s`) executes register saving and restoring in **fewer than 25 CPU cycles**.
 
-### 2.4 Low-Power Background Idle Task
-- Automatically spawns an internal Idle Task at priority `31`.
-- Executes the ARM `wfi` (Wait For Interrupt) low-power sleep instruction whenever all user tasks are asleep, maximizing battery efficiency.
-
-### 2.5 Clean Task Exit Hook
-- If a task function accidentally exits or returns, the kernel automatically diverts execution to `rtos_task_exit_hook`, cleanly moving the task to `TASK_STATE_SUSPENDED` without crashing the CPU.
+### 2.4 Low-Power Background Idle Task & Clean Task Exit Hook
+- Automatically spawns an internal Idle Task at priority `31` that executes the ARM `wfi` (Wait For Interrupt) instruction whenever all user tasks are blocked.
+- If a task function returns, the kernel automatically diverts execution to `rtos_task_exit_hook`, cleanly moving the task to `TASK_STATE_SUSPENDED`.
 
 ---
 
@@ -65,8 +66,8 @@
 
 | Capability | API Function | Description |
 | :--- | :--- | :--- |
-| **System Initialization** | `rtos_init()` | Clears TCB table, initializes ready bitmask, and spawns the Idle task. |
-| **Task Creation** | `rtos_task_create()` | Synthesizes an ARM exception stack frame (`xPSR`, `PC`, `LR`, `R0-R3, R12`, `R4-R11`) and enrolls the task. |
+| **System Initialization** | `rtos_init()` | Clears TCB table, initializes ready bitmask and trace buffer, and spawns the Idle task. |
+| **Task Creation** | `rtos_task_create()` | Fills stack with `0xDEADBEEF` canaries, synthesizes an ARM exception frame (`xPSR`, `PC`, `LR`, `R0-R3, R12`, `R4-R11`), and enrolls the task. |
 | **Kernel Start** | `rtos_start()` | Programs SysTick to 1 ms, configures PendSV priority, switches to PSP, and boots the highest-priority task. |
 | **Non-Busy Sleep** | `rtos_delay(ticks)` | Puts the calling task into `TASK_STATE_BLOCKED`, yielding the CPU to lower-priority tasks. Wakes up precisely on tick match. |
 | **Voluntary Yield** | `rtos_yield()` | Triggers `PendSV` to voluntarily yield the remainder of the current time slice. |
@@ -74,77 +75,96 @@
 
 ---
 
-## 4. Synchronization & Inter-Process Communication (IPC)
+## 4. Synchronization & Inter-Thread Communication (IPC)
 
-### 4.1 Mutex with Priority Inheritance
+### 4.1 Bounded Thread-Safe Message Queues (`rtos_queue_t`)
+- **Zero-Allocation Circular FIFO Buffer**: Backed by a caller-provided static `uint32_t` storage array and two internal counting semaphores (`items_avail` and `slots_free`).
+- **Blocking & Non-Blocking Send/Receive**:
+  - `rtos_queue_init(&q, storage_buf, capacity)`: Initializes a bounded message queue.
+  - `rtos_queue_send(&q, msg, timeout_ticks)`: Enqueues a 32-bit value or struct pointer in FIFO order. If the queue is full, the producer task blocks until a slot frees up or `timeout_ticks` expires. Automatically wakes any higher-priority consumer blocked on `rtos_queue_recv()`.
+  - `rtos_queue_recv(&q, &out_msg, timeout_ticks)`: Dequeues the oldest message. If the queue is empty, the consumer task blocks until a producer sends a message or `timeout_ticks` expires.
+  - `rtos_queue_count(&q)`: Returns the current number of queued messages.
+- **Kernel Trace Integration**: Automatically records `TRACE_QUEUE_SEND` and `TRACE_QUEUE_RECV` events in `g_trace_buffer`.
+
+#### Sample Code: Producer-Consumer Queue in Zen-C (`app/main.zc`)
+```zc
+import "rtos.h" as rtos;
+
+def SENSOR_QUEUE_CAP = 8;
+let g_sensor_queue: rtos::rtos_queue_t;
+let g_sensor_qbuf: u32[8];
+
+// Producer Task (Priority 5)
+fn task_sensor_poll(_arg: void*) {
+    let sample: u32 = 25;
+    while true {
+        sample = sample + 1;
+        // Send temperature sample to consumer (wait up to 10 ticks if full)
+        rtos::rtos_queue_send(&g_sensor_queue, sample, 10);
+        rtos::rtos_delay(200);
+    }
+}
+
+// Consumer Task (Priority 8)
+fn task_telemetry_report(_arg: void*) {
+    let latest_temp: u32 = 0;
+    while true {
+        // Drain all queued sensor samples
+        while rtos::rtos_queue_count(&g_sensor_queue) > 0 {
+            rtos::rtos_queue_recv(&g_sensor_queue, &latest_temp, 10);
+        }
+        rtos::rtos_delay(1000);
+    }
+}
+
+fn main() -> int {
+    rtos::rtos_init();
+    rtos::rtos_queue_init(&g_sensor_queue, &g_sensor_qbuf[0], SENSOR_QUEUE_CAP);
+    // ... create tasks and start scheduler ...
+    return 0;
+}
+```
+
+### 4.2 Mutex with Priority Inheritance (`rtos_mutex_t`)
 - **Recursive Locking**: A task holding a mutex can re-lock it safely without deadlocking itself.
 - **Priority Inversion Prevention**:
-  - If a low-priority task holds a mutex and a high-priority task attempts to acquire it, the kernel **temporarily boosts the low-priority task's priority** to match the high-priority task.
+  - If a low-priority task holds a mutex and a high-priority task attempts to acquire it, the kernel **temporarily boosts the low-priority task's priority** to match the high-priority task (`TRACE_MUTEX_PI_BOOST`).
   - The moment the mutex is unlocked, the original owner's priority is restored, and the waiting high-priority task immediately unblocks and acquires the lock.
 
-### 4.2 Counting & Binary Semaphores
+### 4.3 Counting & Binary Semaphores (`rtos_sem_t`)
 - Configurable initial count and maximum token count.
 - Supports non-blocking acquisition (`timeout_ticks = 0`) or blocking wait with automated sleep queue unblocking upon `rtos_sem_signal()`.
-- FIFO blocked task queue management.
 
 ---
 
-## 5. Hardware & BSP Integration (STM32L476RG)
+## 5. Debug, Profiling & Crash Analysis Subsystem
 
-| Subsystem | Implementation Details |
-| :--- | :--- |
-| **Core Clock** | Default MSI clock at 4 MHz, configurable up to 80 MHz via PLL. |
-| **SysTick Timer** | High-precision 1,000 Hz periodic interrupt (verified at **501 ticks per 500 ms**, <0.2% jitter). |
-| **Onboard LED (LD2)** | Hardware-mapped driver for Pin `PA5` (`GPIOA_ODR`, `GPIOA_BSRR`). |
-| **User Button (B1)** | Hardware-mapped driver for Pin `PC13` (`GPIOC_IDR`). |
-| **Memory Footprint** | **Flash:** 3.4 KB total (code + vector table).<br/>**SRAM:** ~4 KB total (including 3 task stacks of 1 KB each + TCBs). |
-| **Linker Script** | Custom `link.ld` supporting 1024 KB Flash (`0x08000000`) and 128 KB SRAM (`0x20000000`). |
-
----
-
-## 6. Language & Toolchain Highlights
-
-### 6.1 Native Zen-C (`.zc`) Application Layer
-- User tasks and application logic are authored in **Zen-C** (`app/main.zc`), providing:
-  - Strong typing with explicit bit-widths (`u32`, `i32`, `bool`, `void*`).
-  - Strict compile-time checks with unused variable detection.
-  - Zero-overhead transpilation via `/home/mark/code/Zen-C/zc transpile`.
-
-### 6.2 Clang & GCC Bare-Metal Toolchains
-- Supports compilation using **LLVM/Clang** (`--target=arm-none-eabi -mcpu=cortex-m4 -mthumb`) and `ld.lld`.
-- Supports standard GNU **`arm-none-eabi-gcc`**.
-- Completely freestanding (`-nostdlib -ffreestanding`, zero standard C library dependencies).
+| Feature | API / Symbol | Description |
+| :--- | :--- | :--- |
+| **Stack High-Watermark** | `rtos_task_stack_free_words(id)` | Scans `0xDEADBEEF` (`RTOS_STACK_CANARY`) words from `stack_base` upward to measure minimum free stack space. |
+| **Overflow Detector** | `rtos_check_stack_overflow()` | Verifies bottom canary word (`stack_base[0] == 0xDEADBEEF`) and `sp >= stack_base` on every `SysTick`. |
+| **CPU & Task Profiler** | `rtos_get_stats(&stats)` | Computes total context switches, idle ticks, per-task `run_ticks`, and active CPU load percentage (`0..100%`). |
+| **Circular Trace Buffer** | `g_trace_buffer[64]` | Records the last 64 kernel events (task switches, delays, wakeups, mutex PI boosts, queue send/recv, faults) in SRAM. |
+| **HardFault Analyzer** | `g_fault_info` / `rtos_fault_capture()` | Extracts stacked `R0-R3, R12, LR, PC, xPSR` from `MSP`/`PSP` plus `CFSR, HFSR, MMFAR, BFAR` and offending task name. |
+| **Live UART Telemetry** | `bsp_debug_dump_status()` | Streams live task table, stack watermarks, and CPU load over `USART2` (`PA2`/`PA3` ST-LINK VCP `/dev/ttyACM0` @ `115200 8N1`). |
 
 ---
 
-## 7. Dual-Tier Verification & Test Infrastructure
-
-ZenRTOS includes two automated testing tiers out of the box:
+## 6. Dual-Tier Verification & Test Infrastructure
 
 ### Tier 1: Host-Based Unit Test Suite (`make test`)
-Executes natively on Linux (x86_64) via GCC/Clang:
+Executes 9 comprehensive unit tests natively on Linux (x86_64):
 1. **Stack Frame Integrity Test**: Asserts 8-byte alignment, Thumb bit in `xPSR`, and argument placement.
 2. **Priority Preemption Test**: Verifies that the highest priority ready task is always selected by the bitmask.
 3. **Delay & SysTick Precision Test**: Asserts tasks stay blocked for exact tick counts and wake upon completion.
 4. **Priority Inheritance Test**: Proves that a low-priority task holding a mutex is boosted and later reverted upon unlock.
 5. **Semaphore Operation Test**: Verifies token depletion and FIFO wait-list signaling.
-*(Status: **100% Passed**).*
+6. **Stack Canary Watermark & Overflow Test**: Verifies high-watermark word counts and corrupted bottom canary detection.
+7. **Runtime Profiling & CPU Load Test**: Verifies per-task `run_ticks` and active CPU utilization percentage calculation.
+8. **Circular Trace Buffer & HardFault Analyzer Test**: Verifies event ring buffer recording and Cortex-M4 fault frame extraction.
+9. **Message Queue (`rtos_queue_t`) IPC Test**: Verifies FIFO message ordering, queue count tracking, and semaphore synchronization.
+*(Status: **9/9 Unit Tests Passed — 100%**).*
 
-### Tier 2: Physical Hardware In-Circuit Verification (STM32L476)
-- Flashed and verified live on **NUCLEO-L476RG** via OpenOCD and ST-Link.
-- Confirmed CPU execution in `Thread mode` using `PSP`.
-- Verified live green LED (LD2) blinking at 1 Hz (500 ms ON, 500 ms OFF) and telemetry task running concurrently.
-
----
-
-## 8. Summary Comparison with Common RTOSes
-
-| Feature | **ZenRTOS** | **FreeRTOS** | **Zephyr RTOS** |
-| :--- | :--- | :--- | :--- |
-| **Primary Language** | **Zen-C / C** | C | C |
-| **Kernel Binary Size** | **~3.4 KB Flash** | ~6 - 12 KB Flash | ~30 - 60 KB Flash |
-| **Scheduling Algorithm** | **$O(1)$ Hardware Bitmask** | $O(1)$ Bitmap or Linked List | Multilevel Priority Queue |
-| **Dynamic Memory Required** | **None (100% Static)** | Optional heap schemes | Dynamic or Static |
-| **Priority Inheritance** | **Built-in** | Configurable | Built-in |
-| **Context Switch Latency** | **<25 CPU cycles** | ~30 - 40 cycles | ~40 - 70 cycles |
-| **Freestanding Bare-Metal** | **Yes (`-nostdlib`)** | Yes | Needs Zephyr SDK / CMake |
+### Tier 2: Physical Hardware In-Circuit Verification (STM32L476RG)
+- Flashed and verified live on **NUCLEO-L476RG** via OpenOCD and ST-LINK V2-1.
+- Confirmed live `USART2` telemetry streaming over `/dev/ttyACM0`, 1 Hz `PA5` LED toggling, and producer-consumer queue transfer between `Sensor` and `Telemetry` tasks.

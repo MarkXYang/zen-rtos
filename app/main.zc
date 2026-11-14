@@ -5,12 +5,15 @@ import "rtos.h" as rtos;
 import "stm32l476.h" as bsp;
 
 def STACK_SIZE_WORDS = 256;
+def SENSOR_QUEUE_CAP = 8;
 
 let stack_led: u32[256];
 let stack_sensor: u32[256];
 let stack_telemetry: u32[256];
 
 let g_sensor_mutex: rtos::rtos_mutex_t;
+let g_sensor_queue: rtos::rtos_queue_t;
+let g_sensor_qbuf: u32[8];
 let g_shared_temperature: u32 = 25;
 
 fn task_led_blink(_arg: void*) {
@@ -28,19 +31,25 @@ fn task_sensor_poll(_arg: void*) {
         if g_shared_temperature > 45 {
             g_shared_temperature = 20;
         }
+        let sample: u32 = g_shared_temperature;
         rtos::rtos_mutex_unlock(&g_sensor_mutex);
+
+        // Send latest sample to Telemetry task via bounded RTOS message queue
+        rtos::rtos_queue_send(&g_sensor_queue, sample, 10);
         rtos::rtos_delay(200);
     }
 }
 
 fn task_telemetry_report(_arg: void*) {
+    let latest_temp: u32 = 25;
     while true {
-        rtos::rtos_mutex_lock(&g_sensor_mutex, 100);
-        let temp: u32 = g_shared_temperature;
-        rtos::rtos_mutex_unlock(&g_sensor_mutex);
+        // Drain all queued sensor samples from the Producer-Consumer queue
+        while rtos::rtos_queue_count(&g_sensor_queue) > 0 {
+            rtos::rtos_queue_recv(&g_sensor_queue, &latest_temp, 10);
+        }
 
         let _overflow_id: u32 = rtos::rtos_check_stack_overflow();
-        bsp::bsp_debug_dump_status(temp);
+        bsp::bsp_debug_dump_status(latest_temp);
         rtos::rtos_delay(1000);
     }
 }
@@ -51,6 +60,7 @@ fn main() -> int {
 
     rtos::rtos_init();
     rtos::rtos_mutex_init(&g_sensor_mutex);
+    rtos::rtos_queue_init(&g_sensor_queue, &g_sensor_qbuf[0], SENSOR_QUEUE_CAP);
 
     // Create tasks: Priority 5 (Sensor), Priority 8 (Telemetry), Priority 10 (LED)
     rtos::rtos_task_create(task_sensor_poll, NULL, 5, &stack_sensor[0], STACK_SIZE_WORDS, "Sensor");

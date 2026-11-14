@@ -451,6 +451,57 @@ void rtos_mutex_unlock(rtos_mutex_t *mutex) {
     rtos_schedule();
 }
 
+void rtos_queue_init(rtos_queue_t *q, uint32_t *storage_buf, uint32_t capacity) {
+    if (!q || !storage_buf || capacity == 0) return;
+    q->buffer = storage_buf;
+    q->capacity = capacity;
+    q->head = 0;
+    q->tail = 0;
+    q->count = 0;
+    rtos_sem_init(&q->items_avail, 0, (int32_t)capacity);
+    rtos_sem_init(&q->slots_free, (int32_t)capacity, (int32_t)capacity);
+}
+
+bool rtos_queue_send(rtos_queue_t *q, uint32_t msg, uint32_t timeout_ticks) {
+    if (!q || !q->buffer) return false;
+    if (!rtos_sem_wait(&q->slots_free, timeout_ticks)) {
+        return false;
+    }
+
+    rtos_enter_critical();
+    q->buffer[q->head] = msg;
+    q->head = (q->head + 1U) % q->capacity;
+    q->count++;
+    rtos_trace_record(TRACE_QUEUE_SEND, current_tcb ? (uint8_t)current_tcb->id : 0,
+                      (uint16_t)q->count, msg);
+    rtos_exit_critical();
+
+    rtos_sem_signal(&q->items_avail);
+    return true;
+}
+
+bool rtos_queue_recv(rtos_queue_t *q, uint32_t *out_msg, uint32_t timeout_ticks) {
+    if (!q || !q->buffer || !out_msg) return false;
+    if (!rtos_sem_wait(&q->items_avail, timeout_ticks)) {
+        return false;
+    }
+
+    rtos_enter_critical();
+    *out_msg = q->buffer[q->tail];
+    q->tail = (q->tail + 1U) % q->capacity;
+    q->count--;
+    rtos_trace_record(TRACE_QUEUE_RECV, current_tcb ? (uint8_t)current_tcb->id : 0,
+                      (uint16_t)q->count, *out_msg);
+    rtos_exit_critical();
+
+    rtos_sem_signal(&q->slots_free);
+    return true;
+}
+
+uint32_t rtos_queue_count(const rtos_queue_t *q) {
+    return q ? q->count : 0;
+}
+
 // -------------------------------------------------------------------------
 // Debug, Profiling & Trace Implementation
 // -------------------------------------------------------------------------

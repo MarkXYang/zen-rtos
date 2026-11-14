@@ -55,10 +55,12 @@ typedef enum {
     TRACE_MUTEX_PI_BOOST,
     TRACE_STACK_OVERFLOW,
     TRACE_FAULT,
-    TRACE_ASSERT_FAIL
+    TRACE_ASSERT_FAIL,
+    TRACE_QUEUE_SEND,
+    TRACE_QUEUE_RECV
 } rtos_trace_type_t;
 
-// Circular Trace Buffer Entry (16 bytes aligned)
+// Circular Trace Buffer Entry (12 bytes)
 typedef struct {
     uint32_t            tick;                // System tick timestamp
     uint8_t             type;                // rtos_trace_type_t
@@ -113,6 +115,17 @@ typedef struct {
     tcb_t              *wait_list;
 } rtos_mutex_t;
 
+// Inter-Thread Communication: Bounded Circular Message Queue
+typedef struct {
+    uint32_t           *buffer;              // Backing storage array of 32-bit words/messages
+    uint32_t            capacity;            // Maximum number of messages
+    uint32_t            head;                // Write index
+    uint32_t            tail;                // Read index
+    uint32_t            count;               // Current number of queued messages
+    rtos_sem_t          items_avail;         // Signals consumers when data arrives
+    rtos_sem_t          slots_free;          // Signals producers when space frees up
+} rtos_queue_t;
+
 // Kernel Public API
 void        rtos_init(void);
 bool        rtos_task_create(rtos_task_func_t func, void *arg, uint32_t priority,
@@ -122,7 +135,7 @@ void        rtos_delay(uint32_t ticks);
 void        rtos_yield(void);
 uint32_t    rtos_get_tick(void);
 
-// Synchronization API
+// Synchronization & IPC API
 void        rtos_sem_init(rtos_sem_t *sem, int32_t initial_count, int32_t max_count);
 bool        rtos_sem_wait(rtos_sem_t *sem, uint32_t timeout_ticks);
 void        rtos_sem_signal(rtos_sem_t *sem);
@@ -130,6 +143,11 @@ void        rtos_sem_signal(rtos_sem_t *sem);
 void        rtos_mutex_init(rtos_mutex_t *mutex);
 bool        rtos_mutex_lock(rtos_mutex_t *mutex, uint32_t timeout_ticks);
 void        rtos_mutex_unlock(rtos_mutex_t *mutex);
+
+void        rtos_queue_init(rtos_queue_t *q, uint32_t *storage_buf, uint32_t capacity);
+bool        rtos_queue_send(rtos_queue_t *q, uint32_t msg, uint32_t timeout_ticks);
+bool        rtos_queue_recv(rtos_queue_t *q, uint32_t *out_msg, uint32_t timeout_ticks);
+uint32_t    rtos_queue_count(const rtos_queue_t *q);
 
 // Debug, Profiling & Trace API
 uint32_t    rtos_task_stack_free_words(uint32_t task_id);
