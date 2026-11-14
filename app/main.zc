@@ -18,7 +18,7 @@ let g_sensor_qbuf: u32[8];
 let g_shared_temperature: u32 = 25;
 let g_latest_temp: u32 = 25;
 let g_led_auto_blink: u32 = 1;
-let g_telemetry_log_on: u32 = 0;
+let g_telemetry_log_on: u32 = 1;
 
 fn task_led_blink(_arg: void*) {
     bsp::bsp_init_led();

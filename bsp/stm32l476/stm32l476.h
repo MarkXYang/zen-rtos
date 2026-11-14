@@ -236,6 +236,7 @@ static inline void bsp_debug_dump_status(uint32_t shared_temp) {
         bsp_uart_putdec(t->stack_size * 4U);
         bsp_uart_puts("B\n");
     }
+    bsp_uart_puts("zensh> ");
 }
 
 // -------------------------------------------------------------------------
