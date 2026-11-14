@@ -7,17 +7,23 @@
 static uint32_t stack_led[STACK_SIZE_WORDS];
 static uint32_t stack_sensor[STACK_SIZE_WORDS];
 static uint32_t stack_telemetry[STACK_SIZE_WORDS];
+static uint32_t stack_shell[STACK_SIZE_WORDS];
 
 static rtos_mutex_t g_sensor_mutex;
 static rtos_queue_t g_sensor_queue;
 static uint32_t     g_sensor_qbuf[SENSOR_QUEUE_CAP];
 static volatile uint32_t g_shared_temperature = 25;
+static uint32_t     g_latest_temp = 25;
+static volatile uint32_t g_led_auto_blink = 1;
+static volatile uint32_t g_telemetry_log_on = 0;
 
 void task_led_blink(void *arg) {
     (void)arg;
     bsp_init_led();
     while (1) {
-        bsp_toggle_led();
+        if (g_led_auto_blink) {
+            bsp_toggle_led();
+        }
         rtos_delay(500); // 500 ms blink
     }
 }
@@ -43,20 +49,33 @@ void task_sensor_poll(void *arg) {
 
 void task_telemetry_report(void *arg) {
     (void)arg;
-    uint32_t latest_temp = 25;
     while (1) {
         // Drain all queued sensor samples from the message queue
         while (rtos_queue_count(&g_sensor_queue) > 0) {
-            rtos_queue_recv(&g_sensor_queue, &latest_temp, 10);
+            rtos_queue_recv(&g_sensor_queue, &g_latest_temp, 10);
         }
 
-        // Verify stack canaries and emit live debug telemetry over USART2 (ST-LINK VCP)
+        // Verify stack canaries
         uint32_t overflow_id = rtos_check_stack_overflow();
         RTOS_ASSERT(overflow_id == 0);
-        bsp_debug_dump_status(latest_temp);
 
-        // Periodic broadcast every 1 second
+        // Emit periodic console log only when enabled via 'log on' in shell
+        if (g_telemetry_log_on) {
+            bsp_debug_dump_status(g_latest_temp);
+        }
+
+        // Periodic check every 1 second
         rtos_delay(1000);
+    }
+}
+
+void task_shell(void *arg) {
+    (void)arg;
+    bsp_shell_banner();
+    while (1) {
+        bsp_shell_poll(&g_sensor_queue, g_latest_temp,
+                       &g_led_auto_blink, &g_telemetry_log_on);
+        rtos_delay(10); // Poll UART RX every 10 ms (100 Hz responsiveness)
     }
 }
 
@@ -68,8 +87,9 @@ int main(void) {
     rtos_mutex_init(&g_sensor_mutex);
     rtos_queue_init(&g_sensor_queue, g_sensor_qbuf, SENSOR_QUEUE_CAP);
 
-    // Create tasks: Priority 5 (Sensor), Priority 8 (Telemetry), Priority 10 (LED)
+    // Create tasks: Priority 5 (Sensor), Priority 6 (Shell), Priority 8 (Telemetry), Priority 10 (LED)
     rtos_task_create(task_sensor_poll, NULL, 5, stack_sensor, STACK_SIZE_WORDS, "Sensor");
+    rtos_task_create(task_shell, NULL, 6, stack_shell, STACK_SIZE_WORDS, "Shell");
     rtos_task_create(task_telemetry_report, NULL, 8, stack_telemetry, STACK_SIZE_WORDS, "Telemetry");
     rtos_task_create(task_led_blink, NULL, 10, stack_led, STACK_SIZE_WORDS, "BlinkLED");
 

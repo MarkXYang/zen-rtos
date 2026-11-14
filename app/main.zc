@@ -10,16 +10,22 @@ def SENSOR_QUEUE_CAP = 8;
 let stack_led: u32[256];
 let stack_sensor: u32[256];
 let stack_telemetry: u32[256];
+let stack_shell: u32[256];
 
 let g_sensor_mutex: rtos::rtos_mutex_t;
 let g_sensor_queue: rtos::rtos_queue_t;
 let g_sensor_qbuf: u32[8];
 let g_shared_temperature: u32 = 25;
+let g_latest_temp: u32 = 25;
+let g_led_auto_blink: u32 = 1;
+let g_telemetry_log_on: u32 = 0;
 
 fn task_led_blink(_arg: void*) {
     bsp::bsp_init_led();
     while true {
-        bsp::bsp_toggle_led();
+        if g_led_auto_blink != 0 {
+            bsp::bsp_toggle_led();
+        }
         rtos::rtos_delay(500);
     }
 }
@@ -41,16 +47,26 @@ fn task_sensor_poll(_arg: void*) {
 }
 
 fn task_telemetry_report(_arg: void*) {
-    let latest_temp: u32 = 25;
     while true {
-        // Drain all queued sensor samples from the Producer-Consumer queue
+        // Drain queued sensor samples from the Producer-Consumer queue
         while rtos::rtos_queue_count(&g_sensor_queue) > 0 {
-            rtos::rtos_queue_recv(&g_sensor_queue, &latest_temp, 10);
+            rtos::rtos_queue_recv(&g_sensor_queue, &g_latest_temp, 10);
         }
 
         let _overflow_id: u32 = rtos::rtos_check_stack_overflow();
-        bsp::bsp_debug_dump_status(latest_temp);
+        if g_telemetry_log_on != 0 {
+            bsp::bsp_debug_dump_status(g_latest_temp);
+        }
         rtos::rtos_delay(1000);
+    }
+}
+
+fn task_shell(_arg: void*) {
+    bsp::bsp_shell_banner();
+    while true {
+        bsp::bsp_shell_poll(&g_sensor_queue, g_latest_temp,
+                            &g_led_auto_blink, &g_telemetry_log_on);
+        rtos::rtos_delay(10);
     }
 }
 
@@ -62,8 +78,9 @@ fn main() -> int {
     rtos::rtos_mutex_init(&g_sensor_mutex);
     rtos::rtos_queue_init(&g_sensor_queue, &g_sensor_qbuf[0], SENSOR_QUEUE_CAP);
 
-    // Create tasks: Priority 5 (Sensor), Priority 8 (Telemetry), Priority 10 (LED)
+    // Create tasks: Priority 5 (Sensor), Priority 6 (Shell), Priority 8 (Telemetry), Priority 10 (LED)
     rtos::rtos_task_create(task_sensor_poll, NULL, 5, &stack_sensor[0], STACK_SIZE_WORDS, "Sensor");
+    rtos::rtos_task_create(task_shell, NULL, 6, &stack_shell[0], STACK_SIZE_WORDS, "Shell");
     rtos::rtos_task_create(task_telemetry_report, NULL, 8, &stack_telemetry[0], STACK_SIZE_WORDS, "Telemetry");
     rtos::rtos_task_create(task_led_blink, NULL, 10, &stack_led[0], STACK_SIZE_WORDS, "BlinkLED");
 

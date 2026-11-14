@@ -85,12 +85,22 @@ g_pfnVectors:
     .word PendSV_Handler
     .word SysTick_Handler
 
-    /* Peripheral IRQ entries (default to Default_Handler) */
-    .rept 82
+    /* Peripheral IRQ entries 0..37 */
+    .rept 38
+    .word Default_Handler
+    .endr
+
+    /* Peripheral IRQ 38: USART2_IRQHandler */
+    .word USART2_IRQHandler
+
+    /* Peripheral IRQ entries 39..81 */
+    .rept 43
     .word Default_Handler
     .endr
 
 /* Weak aliases */
+.weak USART2_IRQHandler
+.thumb_set USART2_IRQHandler,Default_Handler
 .weak NMI_Handler
 .thumb_set NMI_Handler,Default_Handler
 

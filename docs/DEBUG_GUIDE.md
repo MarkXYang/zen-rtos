@@ -32,16 +32,20 @@
 - **Dual-Stack Exception Extraction**: In [`arch/arm/cortex-m4/context.s`](../arch/arm/cortex-m4/context.s), `HardFault_Handler`, `MemManage_Handler`, `BusFault_Handler`, and `UsageFault_Handler` test Bit 2 of `LR` (`EXC_RETURN`) using `tst lr, #4` to select either `MSP` or `PSP` and pass the faulting stack frame to [`rtos_fault_capture()`](../kernel/rtos.c).
 - **Captured Registers**: Extracts stacked `R0`, `R1`, `R2`, `R3`, `R12`, `LR`, `PC`, `xPSR` alongside Cortex-M4 System Control Block registers `SCB_CFSR` (`0xE000ED28`), `SCB_HFSR` (`0xE000ED2C`), `SCB_MMFAR` (`0xE000ED34`), and `SCB_BFAR` (`0xE000ED38`), plus `offending_task_id` and `offending_task_name`.
 
-### 2.4 Live ST-LINK Virtual COM Port (`USART2`) Telemetry Inspector
-- Configured in [`bsp/stm32l476/stm32l476.h`](../bsp/stm32l476/stm32l476.h) via `bsp_init_uart(4000000, 115200)` on `PA2` (`USART2_TX`) and `PA3` (`USART2_RX`).
-- `bsp_debug_dump_status()` prints a live summary table every `1000 ms`:
-  ```text
-  === [ZenRTOS Debug Telemetry] Tick: 20657 ms | CPU Load: 3% | CtxSw: 325 | Temp: 25C ===
-    Task #1 [Idle] Prio=31 RunTicks=19999 CtxSw=155 StackFree=444/512B
-    Task #2 [Sensor] Prio=5 RunTicks=0 CtxSw=104 StackFree=908/1024B
-    Task #3 [Telemetry] Prio=8 RunTicks=682 CtxSw=25 StackFree=868/1024B
-    Task #4 [BlinkLED] Prio=10 RunTicks=0 CtxSw=41 StackFree=916/1024B
-  ```
+### 2.4 Interactive RTOS Serial Shell (`zensh>`) & `USART2_IRQHandler`
+- Configured in [`bsp/stm32l476/stm32l476.h`](../bsp/stm32l476/stm32l476.h) via `bsp_init_uart(4000000, 115200)` on `PA2` (`USART2_TX`) and `PA3` (`USART2_RX`) with interrupt-driven RX buffering (`USART2_IRQHandler`, IRQ #38).
+- Runs as a dedicated RTOS task (`task_shell`, Priority `6`) in [`app/main.zc`](../app/main.zc) and [`app/main.c`](../app/main.c).
+- Built-in interactive commands:
+  - `help` — Show command reference.
+  - `ps` / `top` — List all tasks (`ID`, `Name`, `State`, `Prio`, `RunTicks`, `CtxSw`, `StackFree`) + CPU load and uptime.
+  - `trace` — Dump the last 12 events from the 64-entry circular trace buffer (`g_trace_buffer`).
+  - `sensor` / `temp` — Display current temperature and pending IPC queue count (`rtos_queue_count`).
+  - `mem` / `stack` — Run `rtos_check_stack_overflow()` and show peak stack usage & `0xDEADBEEF` high-water marks.
+  - `led on` | `led off` | `led toggle` | `led blink` — Control `PA5` green LED manually or return to 1 Hz RTOS blinking.
+  - `log on` | `log off` — Toggle periodic 1-second background telemetry broadcasts.
+  - `fault` — Inspect `g_fault_info` (`PC`, `LR`, `CFSR`, `HFSR`).
+  - `uptime` — Show system uptime in seconds and ticks.
+  - `clear` / `reboot` — Clear screen or trigger Cortex-M4 software reset (`SCB_AIRCR`).
 
 ---
 
