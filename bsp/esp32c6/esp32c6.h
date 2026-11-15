@@ -50,7 +50,7 @@ extern volatile rtos_fault_info_t g_fault_info;
 
 static uint32_t g_mtimer_step = 160000U;
 static volatile bool g_led_state = false;
-static volatile uint32_t g_led_color_grb = 0x200000UL; // Default bright green (G=0x20, R=0x00, B=0x00)
+static volatile uint32_t g_led_color_grb = 0x002000UL; // Default green in 0xRRGGBB order (R=0x00, G=0x20, B=0x00)
 static char     g_shell_cmd_buf[64];
 static volatile uint32_t g_shell_cmd_len = 0;
 
@@ -419,15 +419,15 @@ static inline void bsp_shell_exec(const char *raw_cmd, rtos_queue_t *sensor_q,
         bsp_toggle_led();
         bsp_uart_puts("WS2812 RGB LED (GPIO8) toggled.\n");
     } else if (bsp_streq(cmd, "led red")) {
-        g_led_color_grb = 0x000020UL;
+        g_led_color_grb = 0x200000UL;
         bsp_set_led(true);
         bsp_uart_puts("WS2812 RGB LED color set to RED.\n");
     } else if (bsp_streq(cmd, "led green")) {
-        g_led_color_grb = 0x200000UL;
+        g_led_color_grb = 0x002000UL;
         bsp_set_led(true);
         bsp_uart_puts("WS2812 RGB LED color set to GREEN.\n");
     } else if (bsp_streq(cmd, "led blue")) {
-        g_led_color_grb = 0x002000UL;
+        g_led_color_grb = 0x000020UL;
         bsp_set_led(true);
         bsp_uart_puts("WS2812 RGB LED color set to BLUE.\n");
     } else if (bsp_streq(cmd, "led blink") || bsp_streq(cmd, "ledblink")) {
