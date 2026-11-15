@@ -92,6 +92,11 @@ static inline void bsp_ws2812_write_grb(uint32_t grb) {
     uint32_t mstatus;
     __asm volatile ("csrrci %0, mstatus, 0x8" : "=r"(mstatus) : : "memory");
 
+    // Ensure GPIO8 is low for >80 us (12,800 ticks at 160 MHz) before frame to latch/reset WS2812B
+    GPIO_OUT_W1TC_REG = pin_mask;
+    uint32_t t_rst = CLINT_MTIME_LO;
+    while ((CLINT_MTIME_LO - t_rst) < 12800U) {}
+
     for (int bit = 23; bit >= 0; bit--) {
         uint32_t is_one = (grb >> bit) & 1U;
         uint32_t t_high = is_one ? 128U : 64U; // 800 ns ('1') vs 400 ns ('0') at 160 MHz
@@ -106,15 +111,21 @@ static inline void bsp_ws2812_write_grb(uint32_t grb) {
         while ((CLINT_MTIME_LO - t0) < t_low) {}
     }
 
+    // Hold low for >80 us after frame so WS2812B latches the 24-bit color
+    t_rst = CLINT_MTIME_LO;
+    while ((CLINT_MTIME_LO - t_rst) < 12800U) {}
+
     if (mstatus & 0x8U) {
         __asm volatile ("csrsi mstatus, 0x8" : : : "memory");
     }
 }
 
 static inline void bsp_init_led(void) {
-    // Route GPIO8 pad to simple GPIO output (MCU_SEL=1, FUN_DRV=2)
+    // Route GPIO8 pad to simple GPIO output:
+    // - IO_MUX_GPIO8_REG: MCU_SEL=1 (bit 12), FUN_DRV=2 (bit 10)
+    // - GPIO_FUNC8_OUT_SEL_CFG_REG: OEN_SEL=1 (bit 9) | SIG_GPIO_OUT_IDX=128 (0x80)
     IO_MUX_GPIO8_REG = (1UL << 12) | (2UL << 10);
-    GPIO_FUNC8_OUT_SEL_CFG_REG = 0x100UL;
+    GPIO_FUNC8_OUT_SEL_CFG_REG = (1UL << 9) | 0x80UL;
     GPIO_OUT_W1TC_REG = (1UL << LED_GPIO_PIN);
     GPIO_ENABLE_W1TS_REG = (1UL << LED_GPIO_PIN);
     bsp_ws2812_write_grb(0x000000UL);
