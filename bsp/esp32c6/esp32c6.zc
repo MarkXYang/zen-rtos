@@ -1,0 +1,621 @@
+// ZenRTOS Board Support Package (BSP) in Zen-C
+// Target: Waveshare ESP32-C6-Pico (RISC-V RV32IMAC @ 160 MHz)
+
+import "rtos.h" as rtos;
+
+// 1. ESP32-C6 Watchdog & Clock Registers (Must be unlocked & disabled at boot!)
+def PCR_SYSCLK_CONF_ADDR: u32        = 0x60096110;
+
+def TIMG0_BASE: u32                  = 0x60008000;
+def TIMG0_WDTCONFIG0_ADDR: u32       = 0x60008048;
+def TIMG0_WDTWPROTECT_ADDR: u32      = 0x60008064;
+
+def LP_WDT_BASE: u32                 = 0x600B1C00;
+def LP_WDT_CONFIG0_ADDR: u32         = 0x600B1C00;
+def LP_WDT_WPROTECT_ADDR: u32        = 0x600B1C18;
+def LP_WDT_SWD_CONFIG_ADDR: u32      = 0x600B1C1C;
+def LP_WDT_SWD_WPROTECT_ADDR: u32    = 0x600B1C20;
+
+// 2. ESP32-C6 CLINT Machine Timer Registers (DR_REG_CLINT_M_BASE = 0x20001800)
+def CLINT_MSIP_ADDR: u32             = 0x20001800;
+def CLINT_MTIMECTL_ADDR: u32         = 0x20001804;
+def CLINT_MTIME_LO_ADDR: u32         = 0x20001808;
+def CLINT_MTIME_HI_ADDR: u32         = 0x2000180C;
+def CLINT_MTIMECMP_LO_ADDR: u32      = 0x20001810;
+def CLINT_MTIMECMP_HI_ADDR: u32      = 0x20001814;
+
+// 3. ESP32-C6 Built-in USB-Serial/JTAG Console Registers (/dev/ttyACM1)
+def USB_DEVICE_EP1_ADDR: u32         = 0x6000F000;
+def USB_DEVICE_EP1_CONF_ADDR: u32    = 0x6000F004;
+def USB_EP1_WR_DONE: u32             = 1;
+def USB_EP1_IN_DATA_FREE: u32        = 2;
+def USB_EP1_OUT_DATA_AVAIL: u32      = 4;
+
+// 4. ESP32-C6 GPIO & IO_MUX Registers (GPIO8 = Onboard WS2812B RGB LED on ESP32-C6-Pico)
+def IO_MUX_GPIO8_ADDR: u32           = 0x60090024;
+def GPIO_OUT_ADDR: u32               = 0x60091004;
+def GPIO_OUT_W1TS_ADDR: u32          = 0x60091008;
+def GPIO_OUT_W1TC_ADDR: u32          = 0x6009100C;
+def GPIO_ENABLE_W1TS_ADDR: u32       = 0x60091024;
+def GPIO_FUNC8_OUT_SEL_CFG_ADDR: u32 = 0x60091574;
+def LED_GPIO_PIN: u32                = 8;
+
+let g_mtimer_step: u32 = 160000;
+let g_led_state: bool = false;
+let g_led_color_grb: u32 = 0x002000; // Default green in 0xRRGGBB order (R=0x00, G=0x20, B=0x00)
+let g_shell_cmd_buf: char[64];
+let g_shell_cmd_len: u32 = 0;
+let g_shell_esc_state: u32 = 0;
+let g_shell_last_eol: char = 0;
+
+// Volatile 32-bit MMIO Register Helpers
+@inline
+fn mmio_read32(_addr: u32) -> u32 {
+    let val: u32 = 0;
+    raw { val = *(volatile uint32_t *)(uintptr_t)_addr; }
+    return val;
+}
+
+@inline
+fn mmio_write32(_addr: u32, _val: u32) {
+    raw { *(volatile uint32_t *)(uintptr_t)_addr = _val; }
+}
+
+// Exported for bsp/esp32c6/startup.s (call bsp_disable_watchdogs)
+@used
+fn bsp_disable_watchdogs() {
+    // Ensure CPU clock is switched to 160 MHz SPLL (PCR_SOC_CLK_SEL = 1 in PCR_SYSCLK_CONF_REG)
+    // so both SPI Flash cold-boot and SRAM download mode run at the exact same 160 MHz clock.
+    let sysclk: u32 = mmio_read32(PCR_SYSCLK_CONF_ADDR);
+    mmio_write32(PCR_SYSCLK_CONF_ADDR, (sysclk & ~(3 << 16)) | (1 << 16));
+
+    // Unlock & disable Timer Group 0 WDT
+    mmio_write32(TIMG0_WDTWPROTECT_ADDR, 0x50D83AA1);
+    mmio_write32(TIMG0_WDTCONFIG0_ADDR, 0);
+
+    // Unlock & disable RTC / LP WDT
+    mmio_write32(LP_WDT_WPROTECT_ADDR, 0x50D83AA1);
+    mmio_write32(LP_WDT_CONFIG0_ADDR, 0);
+
+    // Unlock & auto-feed Super WDT
+    mmio_write32(LP_WDT_SWD_WPROTECT_ADDR, 0x50D83AA1);
+    let swd_cfg: u32 = mmio_read32(LP_WDT_SWD_CONFIG_ADDR);
+    mmio_write32(LP_WDT_SWD_CONFIG_ADDR, swd_cfg | (1 << 18));
+}
+
+// Exported for arch/riscv/rv32/context.s (call bsp_ack_mtimer)
+@used
+fn bsp_ack_mtimer() {
+    let hi: u64 = (u64)mmio_read32(CLINT_MTIME_HI_ADDR);
+    let lo: u64 = (u64)mmio_read32(CLINT_MTIME_LO_ADDR);
+    let now: u64 = (hi << 32) | lo;
+    let next: u64 = now + (u64)g_mtimer_step;
+    mmio_write32(CLINT_MTIMECMP_HI_ADDR, (u32)0xFFFFFFFF);
+    mmio_write32(CLINT_MTIMECMP_LO_ADDR, (u32)(next & 0xFFFFFFFF));
+    mmio_write32(CLINT_MTIMECMP_HI_ADDR, (u32)(next >> 32));
+}
+
+// Exported for kernel/rtos.c (call bsp_start_mtimer)
+@used
+fn bsp_start_mtimer(_cpu_freq_hz: u32, tick_freq_hz: u32) {
+    // Enable CLINT MTIME counter (MTCE = bit 0) and timer interrupt (MTIE = bit 1)
+    let ctl: u32 = mmio_read32(CLINT_MTIMECTL_ADDR);
+    mmio_write32(CLINT_MTIMECTL_ADDR, ctl | 0x03);
+    // ESP32-C6 HP RISC-V core runs at 160 MHz; 160,000 cycles = 1.000 ms (1000 Hz)
+    g_mtimer_step = 160000 / (tick_freq_hz / 1000);
+    bsp_ack_mtimer();
+}
+
+// Bare-metal 800 kHz WS2812B-0807 RGB NeoPixel driver on GPIO8 (160 MHz RISC-V core)
+// WS2812B-0807 strict timing:
+//   '0' bit: T0H = 220..380 ns (~250 ns), T0L = 580..1000 ns (~850 ns)
+//   '1' bit: T1H = 580..1000 ns (~750 ns), T1L = 580..1000 ns (~650 ns)
+//   Reset/Latch: > 80 us LOW
+fn bsp_ws2812_write_grb(grb: u32) {
+    let pin_mask: u32 = (1 << LED_GPIO_PIN);
+    let mstatus: u32 = 0;
+    raw { __asm volatile ("csrrci %0, mstatus, 0x8" : "=r"(mstatus) : : "memory"); }
+
+    // Ensure GPIO8 is low for >100 us before frame
+    mmio_write32(GPIO_OUT_W1TC_ADDR, pin_mask);
+    let t_rst: u32 = mmio_read32(CLINT_MTIME_LO_ADDR);
+    while (mmio_read32(CLINT_MTIME_LO_ADDR) - t_rst) < 16000 {}
+
+    let bit: i32 = 23;
+    while bit >= 0 {
+        if ((grb >> (u32)bit) & 1) != 0 {
+            // '1' bit: ~750 ns HIGH, ~650 ns LOW
+            let t0: u32 = mmio_read32(CLINT_MTIME_LO_ADDR);
+            mmio_write32(GPIO_OUT_W1TS_ADDR, pin_mask);
+            while (mmio_read32(CLINT_MTIME_LO_ADDR) - t0) < 110 {}
+            mmio_write32(GPIO_OUT_W1TC_ADDR, pin_mask);
+            t0 = mmio_read32(CLINT_MTIME_LO_ADDR);
+            while (mmio_read32(CLINT_MTIME_LO_ADDR) - t0) < 105 {}
+        } else {
+            // '0' bit: ~250 ns HIGH (24 nops at 160 MHz), ~850 ns LOW
+            mmio_write32(GPIO_OUT_W1TS_ADDR, pin_mask);
+            asm volatile {
+                ".rept 24"
+                "nop"
+                ".endr"
+            }
+            mmio_write32(GPIO_OUT_W1TC_ADDR, pin_mask);
+            let t0: u32 = mmio_read32(CLINT_MTIME_LO_ADDR);
+            while (mmio_read32(CLINT_MTIME_LO_ADDR) - t0) < 135 {}
+        }
+        bit = bit - 1;
+    }
+
+    // Hold low for >100 us after frame so WS2812B-0807 latches the 24-bit color
+    t_rst = mmio_read32(CLINT_MTIME_LO_ADDR);
+    while (mmio_read32(CLINT_MTIME_LO_ADDR) - t_rst) < 16000 {}
+
+    if (mstatus & 0x8) != 0 {
+        asm volatile {
+            "csrsi mstatus, 0x8"
+        }
+    }
+}
+
+fn bsp_init_led() {
+    // Route GPIO8 pad to simple GPIO output:
+    // - IO_MUX_GPIO8_REG: MCU_SEL=1 (bit 12), FUN_DRV=2 (bit 10)
+    // - GPIO_FUNC8_OUT_SEL_CFG_REG: OEN_SEL=1 (bit 9) | SIG_GPIO_OUT_IDX=128 (0x80)
+    mmio_write32(IO_MUX_GPIO8_ADDR, (1 << 12) | (2 << 10));
+    mmio_write32(GPIO_FUNC8_OUT_SEL_CFG_ADDR, (1 << 9) | 0x80);
+    mmio_write32(GPIO_OUT_W1TC_ADDR, (1 << LED_GPIO_PIN));
+    mmio_write32(GPIO_ENABLE_W1TS_ADDR, (1 << LED_GPIO_PIN));
+    bsp_ws2812_write_grb(0x000000);
+}
+
+fn bsp_set_led(on: bool) {
+    g_led_state = on;
+    if on {
+        bsp_ws2812_write_grb(g_led_color_grb);
+    } else {
+        bsp_ws2812_write_grb(0x000000);
+    }
+}
+
+fn bsp_toggle_led() {
+    bsp_set_led(!g_led_state);
+}
+
+fn bsp_get_led() -> bool {
+    return g_led_state;
+}
+
+fn bsp_init_uart(_cpu_freq_hz: u32, _baud: u32) {
+    // USB-Serial/JTAG is pre-initialized by ESP32-C6 ROM
+}
+
+fn bsp_usb_write_byte(b: u8) {
+    let wait: u32 = 0;
+    while wait < 2000 {
+        if (mmio_read32(USB_DEVICE_EP1_CONF_ADDR) & USB_EP1_IN_DATA_FREE) != 0 {
+            mmio_write32(USB_DEVICE_EP1_ADDR, (u32)b);
+            return;
+        }
+        wait = wait + 1;
+    }
+}
+
+fn bsp_uart_putc(c: char) {
+    if c == '\n' {
+        bsp_usb_write_byte((u8)'\r');
+    }
+    bsp_usb_write_byte((u8)c);
+    if c == '\n' {
+        mmio_write32(USB_DEVICE_EP1_CONF_ADDR, USB_EP1_WR_DONE);
+    }
+}
+
+fn bsp_uart_getc(out_c: char*) -> bool {
+    if (mmio_read32(USB_DEVICE_EP1_CONF_ADDR) & USB_EP1_OUT_DATA_AVAIL) != 0 {
+        *out_c = (char)(mmio_read32(USB_DEVICE_EP1_ADDR) & 0xFF);
+        return true;
+    }
+    return false;
+}
+
+fn bsp_uart_puts(s: char*) {
+    if s == NULL {
+        return;
+    }
+    let idx: u32 = 0;
+    while s[idx] != '\0' {
+        bsp_uart_putc(s[idx]);
+        idx = idx + 1;
+    }
+    mmio_write32(USB_DEVICE_EP1_CONF_ADDR, USB_EP1_WR_DONE);
+}
+
+fn bsp_uart_putdec(val: u32) {
+    let buf: char[12];
+    let i: i32 = 0;
+    let v: u32 = val;
+    if v == 0 {
+        bsp_uart_putc('0');
+        return;
+    }
+    while v > 0 && i < 11 {
+        buf[i] = (char)((u32)'0' + (v % 10));
+        v = v / 10;
+        i = i + 1;
+    }
+    while i > 0 {
+        i = i - 1;
+        bsp_uart_putc(buf[i]);
+    }
+}
+
+fn bsp_uart_puthex(val: u32) {
+    let hex: char* = "0123456789ABCDEF";
+    bsp_uart_puts("0x");
+    let shift: i32 = 28;
+    while shift >= 0 {
+        let nibble: u32 = (val >> (u32)shift) & 0xF;
+        bsp_uart_putc(hex[nibble]);
+        shift = shift - 4;
+    }
+}
+
+fn bsp_task_state_str(st: rtos::task_state_t) -> char* {
+    if st == rtos::TASK_STATE_READY {
+        return "READY  ";
+    } else if st == rtos::TASK_STATE_BLOCKED {
+        return "BLOCKED";
+    } else if st == rtos::TASK_STATE_SUSPENDED {
+        return "SUSPEND";
+    }
+    return "UNKNOWN";
+}
+
+fn bsp_trace_type_str(t_type: u8) -> char* {
+    let tr: rtos::rtos_trace_type_t = (rtos::rtos_trace_type_t)t_type;
+    if tr == rtos::TRACE_TASK_CREATE {
+        return "TASK_CREATE ";
+    } else if tr == rtos::TRACE_TASK_SWITCH {
+        return "TASK_SWITCH ";
+    } else if tr == rtos::TRACE_TASK_DELAY {
+        return "TASK_DELAY  ";
+    } else if tr == rtos::TRACE_TASK_WAKE {
+        return "TASK_WAKE   ";
+    } else if tr == rtos::TRACE_SEM_WAIT {
+        return "SEM_WAIT    ";
+    } else if tr == rtos::TRACE_SEM_SIGNAL {
+        return "SEM_SIGNAL  ";
+    } else if tr == rtos::TRACE_MUTEX_LOCK {
+        return "MUTEX_LOCK  ";
+    } else if tr == rtos::TRACE_MUTEX_UNLOCK {
+        return "MUTEX_UNLOCK";
+    } else if tr == rtos::TRACE_MUTEX_PI_BOOST {
+        return "MUTEX_PI_BST";
+    } else if tr == rtos::TRACE_STACK_OVERFLOW {
+        return "STACK_OVFLW ";
+    } else if tr == rtos::TRACE_FAULT {
+        return "HARD_FAULT  ";
+    } else if tr == rtos::TRACE_ASSERT_FAIL {
+        return "ASSERT_FAIL ";
+    } else if tr == rtos::TRACE_QUEUE_SEND {
+        return "QUEUE_SEND  ";
+    } else if tr == rtos::TRACE_QUEUE_RECV {
+        return "QUEUE_RECV  ";
+    }
+    return "NONE        ";
+}
+
+fn bsp_debug_dump_status_table(shared_temp: u32) {
+    let stats: rtos::rtos_stats_t;
+    rtos::rtos_get_stats(&stats);
+
+    bsp_uart_puts("\n=== [ZenRTOS ESP32-C6 Telemetry] Tick: ");
+    bsp_uart_putdec(stats.uptime_ticks);
+    bsp_uart_puts(" ms | CPU Load: ");
+    bsp_uart_putdec(stats.cpu_load_percent);
+    bsp_uart_puts("% | CtxSw: ");
+    bsp_uart_putdec(stats.total_ctx_switches);
+    bsp_uart_puts(" | Temp: ");
+    bsp_uart_putdec(shared_temp);
+    bsp_uart_puts("C ===\n");
+    bsp_uart_puts("  ID  Name        State    Prio  RunTicks  CtxSw  StackFree\n");
+    bsp_uart_puts("  --  ----------  -------  ----  --------  -----  ---------\n");
+
+    let id: u32 = 1;
+    while id <= stats.task_count {
+        let t: rtos::tcb_t* = (rtos::tcb_t*)rtos::rtos_get_task_by_id(id);
+        if t != NULL {
+            let free_words: u32 = rtos::rtos_task_stack_free_words(id);
+            bsp_uart_puts("  #");
+            bsp_uart_putdec(t.id);
+            bsp_uart_puts("  ");
+            bsp_uart_puts((char*)t.name);
+            let len: u32 = 0;
+            let p: char* = (char*)t.name;
+            while p[len] != '\0' {
+                len = len + 1;
+            }
+            while len < 12 {
+                bsp_uart_putc(' ');
+                len = len + 1;
+            }
+
+            bsp_uart_puts(bsp_task_state_str(t.state));
+            bsp_uart_puts("  ");
+            bsp_uart_putdec(t.current_priority);
+            if t.current_priority < 10 {
+                bsp_uart_putc(' ');
+            }
+            bsp_uart_puts("    ");
+            bsp_uart_putdec(t.run_ticks);
+            bsp_uart_puts("\t   ");
+            bsp_uart_putdec(t.ctx_switches);
+            bsp_uart_puts("\t  ");
+            bsp_uart_putdec(free_words * 4);
+            bsp_uart_puts("/");
+            bsp_uart_putdec(t.stack_size * 4);
+            bsp_uart_puts("B\n");
+        }
+        id = id + 1;
+    }
+}
+
+fn bsp_debug_dump_status(shared_temp: u32) {
+    if g_shell_cmd_len > 0 {
+        return;
+    }
+    bsp_debug_dump_status_table(shared_temp);
+    bsp_uart_puts("zensh> ");
+}
+
+fn bsp_tolower(c: char) -> char {
+    if c >= 'A' && c <= 'Z' {
+        return (char)((u32)c + ((u32)'a' - (u32)'A'));
+    }
+    return c;
+}
+
+fn bsp_streq(a: char*, b: char*) -> bool {
+    let i: u32 = 0;
+    while a[i] != '\0' && b[i] != '\0' {
+        if bsp_tolower(a[i]) != bsp_tolower(b[i]) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return a[i] == '\0' && b[i] == '\0';
+}
+
+fn bsp_shell_prompt() {
+    bsp_uart_puts("zensh> ");
+}
+
+fn bsp_shell_banner() {
+    bsp_uart_puts("\n========================================================\n");
+    bsp_uart_puts("  ZenRTOS Interactive Shell (zensh v1.2) - ESP32-C6-Pico\n");
+    bsp_uart_puts("  Type 'help' for available RTOS inspection commands.   \n");
+    bsp_uart_puts("  Type 'log off' to stop periodic telemetry printout.   \n");
+    bsp_uart_puts("========================================================\n");
+    bsp_shell_prompt();
+}
+
+fn bsp_shell_exec(raw_cmd: char*, sensor_q: rtos::rtos_queue_t*,
+                  latest_temp: u32, led_auto_blink: u32*,
+                  telemetry_log_on: u32*) {
+    let start: u32 = 0;
+    while raw_cmd[start] == ' ' || raw_cmd[start] == '\t' {
+        start = start + 1;
+    }
+    let cmd: char* = &raw_cmd[start];
+    if cmd[0] == '\0' {
+        return;
+    }
+
+    if bsp_streq(cmd, "help") || bsp_streq(cmd, "?") {
+        bsp_uart_puts("Available ZenRTOS Shell Commands:\n");
+        bsp_uart_puts("  help            - Show this command reference\n");
+        bsp_uart_puts("  ps / top        - List all tasks, priorities, CPU load & stack watermarks\n");
+        bsp_uart_puts("  trace           - Dump recent kernel trace ring buffer events\n");
+        bsp_uart_puts("  sensor / temp   - Read latest sensor temperature & IPC queue count\n");
+        bsp_uart_puts("  mem / stack     - Check stack canary (0xDEADBEEF) & high-water marks\n");
+        bsp_uart_puts("  led on|off      - Turn GPIO8 WS2812 RGB LED ON or OFF (manual override)\n");
+        bsp_uart_puts("  led toggle      - Toggle GPIO8 WS2812 RGB LED state\n");
+        bsp_uart_puts("  led red|green|blue - Set WS2812 RGB LED color\n");
+        bsp_uart_puts("  led blink       - Resume automatic 1 Hz RTOS LED blinking task\n");
+        bsp_uart_puts("  log on|off      - Enable/disable periodic telemetry console stream\n");
+        bsp_uart_puts("  fault           - Show RISC-V post-mortem exception CSR record\n");
+        bsp_uart_puts("  uptime          - Show system tick counter and uptime\n");
+        bsp_uart_puts("  clear           - Clear terminal screen\n");
+    } else if bsp_streq(cmd, "ps") || bsp_streq(cmd, "top") {
+        bsp_debug_dump_status_table(latest_temp);
+    } else if bsp_streq(cmd, "trace") {
+        let buf: const rtos::rtos_trace_event_t* = NULL;
+        let head: u32 = 0;
+        let count: u32 = rtos::rtos_trace_get_events(&buf, &head);
+        let show: u32 = count;
+        if show > 12 {
+            show = 12;
+        }
+        bsp_uart_puts("=== Recent Kernel Trace Events (showing last ");
+        bsp_uart_putdec(show);
+        bsp_uart_puts(" of ");
+        bsp_uart_putdec(count);
+        bsp_uart_puts(") ===\n");
+        let i: u32 = 0;
+        while i < show {
+            let idx: u32 = (head + 64 - show + i) % 64;
+            bsp_uart_puts("  [");
+            bsp_uart_putdec(buf[idx].tick);
+            bsp_uart_puts(" ms] ");
+            bsp_uart_puts(bsp_trace_type_str(buf[idx].type));
+            bsp_uart_puts(" Task=#");
+            bsp_uart_putdec((u32)buf[idx].task_id);
+            bsp_uart_puts(" arg1=");
+            bsp_uart_putdec((u32)buf[idx].arg1);
+            bsp_uart_puts(" arg2=");
+            bsp_uart_putdec(buf[idx].arg2);
+            bsp_uart_puts("\n");
+            i = i + 1;
+        }
+    } else if bsp_streq(cmd, "sensor") || bsp_streq(cmd, "temp") || bsp_streq(cmd, "queue") || bsp_streq(cmd, "queues") {
+        bsp_uart_puts("Sensor Temperature : ");
+        bsp_uart_putdec(latest_temp);
+        bsp_uart_puts(" C\n");
+        bsp_uart_puts("IPC Queue Pending  : ");
+        bsp_uart_putdec(rtos::rtos_queue_count(sensor_q));
+        bsp_uart_puts(" / ");
+        if sensor_q != NULL {
+            bsp_uart_putdec(sensor_q.capacity);
+        } else {
+            bsp_uart_putdec(0);
+        }
+        bsp_uart_puts(" msgs\n");
+        bsp_uart_puts("Onboard RGB (GPIO8): ");
+        if bsp_get_led() {
+            bsp_uart_puts("ON");
+        } else {
+            bsp_uart_puts("OFF");
+        }
+        if *led_auto_blink != 0 {
+            bsp_uart_puts(" (Auto-Blink 1Hz)\n");
+        } else {
+            bsp_uart_puts(" (Manual Override)\n");
+        }
+    } else if bsp_streq(cmd, "mem") || bsp_streq(cmd, "stack") {
+        let ovf: u32 = rtos::rtos_check_stack_overflow();
+        bsp_uart_puts("Stack Canary Check (0xDEADBEEF): ");
+        if ovf == 0 {
+            bsp_uart_puts("PASS (All task stacks intact)\n");
+        } else {
+            bsp_uart_puts("FAIL! Overflow in Task #");
+            bsp_uart_putdec(ovf);
+            bsp_uart_puts("\n");
+        }
+    } else if bsp_streq(cmd, "led on") || bsp_streq(cmd, "ledon") {
+        *led_auto_blink = 0;
+        bsp_set_led(true);
+        bsp_uart_puts("WS2812 RGB LED (GPIO8) set to ON.\n");
+    } else if bsp_streq(cmd, "led off") || bsp_streq(cmd, "ledoff") {
+        *led_auto_blink = 0;
+        bsp_set_led(false);
+        bsp_uart_puts("WS2812 RGB LED (GPIO8) set to OFF.\n");
+    } else if bsp_streq(cmd, "led toggle") || bsp_streq(cmd, "ledtoggle") {
+        *led_auto_blink = 0;
+        bsp_toggle_led();
+        bsp_uart_puts("WS2812 RGB LED (GPIO8) toggled.\n");
+    } else if bsp_streq(cmd, "led red") {
+        g_led_color_grb = 0x200000;
+        bsp_set_led(true);
+        bsp_uart_puts("WS2812 RGB LED color set to RED.\n");
+    } else if bsp_streq(cmd, "led green") {
+        g_led_color_grb = 0x002000;
+        bsp_set_led(true);
+        bsp_uart_puts("WS2812 RGB LED color set to GREEN.\n");
+    } else if bsp_streq(cmd, "led blue") {
+        g_led_color_grb = 0x000020;
+        bsp_set_led(true);
+        bsp_uart_puts("WS2812 RGB LED color set to BLUE.\n");
+    } else if bsp_streq(cmd, "led blink") || bsp_streq(cmd, "ledblink") {
+        *led_auto_blink = 1;
+        bsp_uart_puts("WS2812 RGB LED (GPIO8) returned to automatic 1 Hz RTOS blink.\n");
+    } else if bsp_streq(cmd, "log on") || bsp_streq(cmd, "logon") || bsp_streq(cmd, "log 1") {
+        *telemetry_log_on = 1;
+        bsp_uart_puts("Periodic telemetry broadcast ENABLED.\n");
+    } else if bsp_streq(cmd, "log off") || bsp_streq(cmd, "logoff") || bsp_streq(cmd, "log 0") || bsp_streq(cmd, "quiet") || bsp_streq(cmd, "stop") {
+        *telemetry_log_on = 0;
+        bsp_uart_puts("Periodic telemetry broadcast DISABLED.\n");
+    } else if bsp_streq(cmd, "fault") {
+        bsp_uart_puts("Fault Status: ");
+        if rtos::g_fault_info.active != 0 {
+            bsp_uart_puts("ACTIVE FAULT RECORDED\n");
+        } else {
+            bsp_uart_puts("NONE (Healthy)\n");
+        }
+        bsp_uart_puts("  MEPC   = "); bsp_uart_puthex(rtos::g_fault_info.bfar);
+        bsp_uart_puts("  MCAUSE = "); bsp_uart_puthex(rtos::g_fault_info.cfsr); bsp_uart_puts("\n");
+        bsp_uart_puts("  MTVAL  = "); bsp_uart_puthex(rtos::g_fault_info.mmfar);
+        bsp_uart_puts("  MSTAT  = "); bsp_uart_puthex(rtos::g_fault_info.hfsr); bsp_uart_puts("\n");
+    } else if bsp_streq(cmd, "uptime") {
+        let ticks: u32 = rtos::rtos_get_tick();
+        bsp_uart_puts("Uptime: ");
+        bsp_uart_putdec(ticks / 1000);
+        bsp_uart_putc('.');
+        let ms: u32 = ticks % 1000;
+        if ms < 100 {
+            bsp_uart_putc('0');
+        }
+        if ms < 10 {
+            bsp_uart_putc('0');
+        }
+        bsp_uart_putdec(ms);
+        bsp_uart_puts(" s (");
+        bsp_uart_putdec(ticks);
+        bsp_uart_puts(" ticks)\n");
+    } else if bsp_streq(cmd, "clear") || bsp_streq(cmd, "cls") {
+        bsp_uart_puts("\x1b[2J\x1b[H");
+    } else {
+        bsp_uart_puts("Unknown command: '");
+        bsp_uart_puts(cmd);
+        bsp_uart_puts("'. Type 'help' for available commands.\n");
+    }
+}
+
+fn bsp_shell_poll(sensor_q: rtos::rtos_queue_t*, latest_temp: u32,
+                  led_auto_blink: u32*, telemetry_log_on: u32*) {
+    let c: char = 0;
+
+    while bsp_uart_getc(&c) {
+        if g_shell_esc_state == 1 {
+            if c == '[' {
+                g_shell_esc_state = 2;
+            } else {
+                g_shell_esc_state = 0;
+            }
+            continue;
+        } else if g_shell_esc_state == 2 {
+            if (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '~' {
+                g_shell_esc_state = 0;
+            }
+            continue;
+        }
+        if (u8)c == 0x1B {
+            g_shell_esc_state = 1;
+            continue;
+        }
+        if (c == '\n' && g_shell_last_eol == '\r') || (c == '\r' && g_shell_last_eol == '\n') {
+            g_shell_last_eol = 0;
+            continue;
+        }
+
+        if c == '\r' || c == '\n' {
+            g_shell_last_eol = c;
+            bsp_uart_puts("\n");
+            g_shell_cmd_buf[g_shell_cmd_len] = '\0';
+            while g_shell_cmd_len > 0 &&
+                  (g_shell_cmd_buf[g_shell_cmd_len - 1] == ' ' ||
+                   g_shell_cmd_buf[g_shell_cmd_len - 1] == '\t') {
+                g_shell_cmd_len = g_shell_cmd_len - 1;
+                g_shell_cmd_buf[g_shell_cmd_len] = '\0';
+            }
+            bsp_shell_exec(&g_shell_cmd_buf[0], sensor_q, latest_temp,
+                           led_auto_blink, telemetry_log_on);
+            g_shell_cmd_len = 0;
+            bsp_shell_prompt();
+        } else {
+            g_shell_last_eol = 0;
+            if c == '\b' || (u8)c == 0x7F {
+                if g_shell_cmd_len > 0 {
+                    g_shell_cmd_len = g_shell_cmd_len - 1;
+                    bsp_uart_puts("\b \b");
+                }
+            } else if (u8)c >= 0x20 && (u8)c < 0x7F {
+                if g_shell_cmd_len < 63 {
+                    g_shell_cmd_buf[g_shell_cmd_len] = c;
+                    g_shell_cmd_len = g_shell_cmd_len + 1;
+                    bsp_uart_putc(c);
+                    mmio_write32(USB_DEVICE_EP1_CONF_ADDR, USB_EP1_WR_DONE);
+                }
+            }
+        }
+    }
+}

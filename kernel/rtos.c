@@ -362,7 +362,20 @@ bool rtos_sem_wait(rtos_sem_t *sem, uint32_t timeout_ticks) {
     while (t->state == TASK_STATE_BLOCKED) {}
 #endif
 
-    return (t->sleep_ticks > 0 || timeout_ticks == 0);
+    // Check if we timed out (still present in sem->wait_list) vs woken by rtos_sem_signal()
+    rtos_enter_critical();
+    tcb_t **pp = &sem->wait_list;
+    while (*pp != NULL) {
+        if (*pp == t) {
+            *pp = t->next_blocked;
+            t->next_blocked = NULL;
+            rtos_exit_critical();
+            return false;
+        }
+        pp = &((*pp)->next_blocked);
+    }
+    rtos_exit_critical();
+    return true;
 }
 
 void rtos_sem_signal(rtos_sem_t *sem) {

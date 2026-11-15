@@ -157,6 +157,7 @@ const tcb_t*rtos_get_task_by_id(uint32_t task_id);
 uint32_t    rtos_trace_get_events(const rtos_trace_event_t **out_buf, uint32_t *out_head);
 void        rtos_assert_fail(const char *file, uint32_t line);
 void        rtos_fault_capture(uint32_t *fault_sp);
+extern volatile rtos_fault_info_t g_fault_info;
 
 #define RTOS_ASSERT(expr) \
     do { if (!(expr)) { rtos_assert_fail(__FILE__, __LINE__); } } while (0)

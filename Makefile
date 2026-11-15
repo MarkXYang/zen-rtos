@@ -14,6 +14,7 @@ CPU           ?= cortex-m4
 CFLAGS_ARM    ?= --target=$(TARGET_TRIPLE) -mcpu=$(CPU) -mthumb \
                  -mfloat-abi=soft -O2 -Wall -Wextra -ffreestanding \
                  -Wno-unused-parameter -Wno-unused-variable -Wno-unused-function \
+                 -Wno-parentheses-equality \
                  -DZC_FUNC= -DZC_GLOBAL= \
                  -Ikernel/include -Ibsp/stm32l476 -Iarch/arm/cortex-m4 \
                  -fdata-sections -ffunction-sections
@@ -27,6 +28,7 @@ LDFLAGS_ARM   ?= --target=$(TARGET_TRIPLE) -mcpu=$(CPU) -mthumb \
 CFLAGS_ESP32C6  ?= --target=riscv32-unknown-elf -march=rv32imac -mabi=ilp32 \
                    -mcmodel=medany -O2 -Wall -Wextra -ffreestanding \
                    -Wno-unused-parameter -Wno-unused-variable -Wno-unused-function \
+                   -Wno-parentheses-equality \
                    -DRTOS_ARCH_RISCV -DZC_FUNC= -DZC_GLOBAL= \
                    -Ikernel/include -Ibsp/esp32c6 -Iarch/riscv/rv32 \
                    -fdata-sections -ffunction-sections
@@ -54,16 +56,26 @@ $(BUILD_DIR)/test_scheduler: tests/host/test_scheduler.c kernel/rtos.c
 	$(CC_HOST) $(CFLAGS_HOST) $^ -o $@
 
 # ----------------------------------------------------------------------
-# Target 2: Zen-C Freestanding Transpilation (app/main.zc -> app/main_zc.c)
+# Target 2: Zen-C Freestanding Transpilation (app/main.zc + BSP .zc)
 # ----------------------------------------------------------------------
-zenc: app/main_zc.c
+zenc: app/main_zc.c $(BUILD_DIR)/stm32l476_zc.c $(BUILD_DIR)/esp32c6_zc.c
 
-app/main_zc.c: app/main.zc kernel/include/rtos.h bsp/stm32l476/stm32l476.h bsp/esp32c6/esp32c6.h
-	@echo "--- Transpiling Zen-C (--freestanding) to C ---"
-	$(ZC) transpile --freestanding app/main.zc -Ikernel/include -Ibsp/stm32l476 -o app/main_zc.c
+app/main_zc.c: app/main.zc kernel/include/rtos.h
+	@echo "--- Transpiling Zen-C Application (app/main.zc) to C ---"
+	$(ZC) transpile --freestanding app/main.zc -Ikernel/include -o app/main_zc.c
+
+$(BUILD_DIR)/stm32l476_zc.c: bsp/stm32l476/stm32l476.zc kernel/include/rtos.h
+	@mkdir -p $(BUILD_DIR)
+	@echo "--- Transpiling Zen-C STM32L476 BSP (bsp/stm32l476/stm32l476.zc) to C ---"
+	$(ZC) transpile --freestanding bsp/stm32l476/stm32l476.zc -Ikernel/include -o $(BUILD_DIR)/stm32l476_zc.c
+
+$(BUILD_DIR)/esp32c6_zc.c: bsp/esp32c6/esp32c6.zc kernel/include/rtos.h
+	@mkdir -p $(BUILD_DIR)
+	@echo "--- Transpiling Zen-C ESP32-C6 BSP (bsp/esp32c6/esp32c6.zc) to C ---"
+	$(ZC) transpile --freestanding bsp/esp32c6/esp32c6.zc -Ikernel/include -o $(BUILD_DIR)/esp32c6_zc.c
 
 # ----------------------------------------------------------------------
-# Target 3: STM32L476 Bare-Metal Binary Build (directly from app/main.zc!)
+# Target 3: STM32L476 Bare-Metal Binary Build (from app/main.zc + stm32l476.zc)
 # ----------------------------------------------------------------------
 build: $(BUILD_DIR)/zen_rtos.bin $(BUILD_DIR)/zen_rtos.elf
 	@echo "--- STM32L476 ZenRTOS Build Complete ---"
@@ -72,6 +84,7 @@ build: $(BUILD_DIR)/zen_rtos.bin $(BUILD_DIR)/zen_rtos.elf
 $(BUILD_DIR)/zen_rtos.elf: kernel/rtos.c \
                            arch/arm/cortex-m4/context.s \
                            bsp/stm32l476/startup.s \
+                           $(BUILD_DIR)/stm32l476_zc.c \
                            app/main_zc.c
 	@mkdir -p $(BUILD_DIR)
 	$(CLANG) $(CFLAGS_ARM) $(LDFLAGS_ARM) $^ -o $@
@@ -80,7 +93,7 @@ $(BUILD_DIR)/zen_rtos.bin: $(BUILD_DIR)/zen_rtos.elf
 	$(LLVM_OBJCOPY) -O binary $< $@
 
 # ----------------------------------------------------------------------
-# Target 4: ESP32-C6-Pico Bare-Metal RISC-V Build (directly from app/main.zc!)
+# Target 4: ESP32-C6-Pico Bare-Metal RISC-V Build (from app/main.zc + esp32c6.zc)
 # ----------------------------------------------------------------------
 esp32c6: $(BUILD_DIR)/zen_rtos_esp32c6.bin $(BUILD_DIR)/zen_rtos_esp32c6.elf
 	@echo "--- ESP32-C6-Pico (RISC-V RV32IMAC) ZenRTOS Build Complete ---"
@@ -89,6 +102,7 @@ esp32c6: $(BUILD_DIR)/zen_rtos_esp32c6.bin $(BUILD_DIR)/zen_rtos_esp32c6.elf
 $(BUILD_DIR)/zen_rtos_esp32c6.elf: kernel/rtos.c \
                                    arch/riscv/rv32/context.s \
                                    bsp/esp32c6/startup.s \
+                                   $(BUILD_DIR)/esp32c6_zc.c \
                                    app/main_zc.c
 	@mkdir -p $(BUILD_DIR)
 	$(CLANG) $(CFLAGS_ESP32C6) $(LDFLAGS_ESP32C6) $^ -o $@

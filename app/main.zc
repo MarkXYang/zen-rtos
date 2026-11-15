@@ -1,8 +1,17 @@
 // ZenRTOS Application in Zen-C
-// Target: STM32L476RG (NUCLEO-L476RG)
+// Targets: STM32L476RG (ARM Cortex-M4) & ESP32-C6-Pico (RISC-V RV32IMAC)
 
 import "rtos.h" as rtos;
-import "stm32l476.h" as bsp;
+
+// Board Support Package (BSP) interface implemented in bsp/<board>/<board>.zc
+extern fn bsp_init_led();
+extern fn bsp_toggle_led();
+extern fn bsp_debug_dump_status(shared_temp: u32);
+extern fn bsp_shell_banner();
+extern fn bsp_shell_poll(sensor_q: rtos::rtos_queue_t*, latest_temp: u32,
+                         led_auto_blink: u32*, telemetry_log_on: u32*);
+extern fn bsp_init_uart(cpu_freq_hz: u32, baud: u32);
+extern fn bsp_uart_puts(s: char*);
 
 def STACK_SIZE_WORDS = 256;
 def SENSOR_QUEUE_CAP = 8;
@@ -21,10 +30,10 @@ let g_led_auto_blink: u32 = 1;
 let g_telemetry_log_on: u32 = 1;
 
 fn task_led_blink(_arg: void*) {
-    bsp::bsp_init_led();
+    bsp_init_led();
     while true {
         if g_led_auto_blink != 0 {
-            bsp::bsp_toggle_led();
+            bsp_toggle_led();
         }
         rtos::rtos_delay(500);
     }
@@ -55,24 +64,24 @@ fn task_telemetry_report(_arg: void*) {
 
         let _overflow_id: u32 = rtos::rtos_check_stack_overflow();
         if g_telemetry_log_on != 0 {
-            bsp::bsp_debug_dump_status(g_latest_temp);
+            bsp_debug_dump_status(g_latest_temp);
         }
         rtos::rtos_delay(1000);
     }
 }
 
 fn task_shell(_arg: void*) {
-    bsp::bsp_shell_banner();
+    bsp_shell_banner();
     while true {
-        bsp::bsp_shell_poll(&g_sensor_queue, g_latest_temp,
-                            &g_led_auto_blink, &g_telemetry_log_on);
+        bsp_shell_poll(&g_sensor_queue, g_latest_temp,
+                       &g_led_auto_blink, &g_telemetry_log_on);
         rtos::rtos_delay(10);
     }
 }
 
 fn main() -> int {
-    bsp::bsp_init_uart(4000000, 115200);
-    bsp::bsp_uart_puts("\n[ZenRTOS] Booting on STM32L476RG (4 MHz MSI, 115200 8N1)...\n");
+    bsp_init_uart(4000000, 115200);
+    bsp_uart_puts("\n[ZenRTOS] Booting Zen-C RTOS Application...\n");
 
     rtos::rtos_init();
     rtos::rtos_mutex_init(&g_sensor_mutex);
@@ -84,7 +93,7 @@ fn main() -> int {
     rtos::rtos_task_create(task_telemetry_report, NULL, 8, &stack_telemetry[0], STACK_SIZE_WORDS, "Telemetry");
     rtos::rtos_task_create(task_led_blink, NULL, 10, &stack_led[0], STACK_SIZE_WORDS, "BlinkLED");
 
-    // Start RTOS on STM32L476: 4 MHz default MSI clock, 1000 Hz SysTick (1 ms)
+    // Start RTOS scheduler (1000 Hz tick = 1 ms)
     rtos::rtos_start(4000000, 1000);
 
     return 0;
