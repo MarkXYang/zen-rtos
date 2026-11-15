@@ -1,6 +1,10 @@
 #ifndef STM32L476_H
 #define STM32L476_H
 
+#ifdef RTOS_ARCH_RISCV
+#include "../esp32c6/esp32c6.h"
+#else
+
 #include <stdint.h>
 #include <stdbool.h>
 #include "rtos.h"
@@ -487,4 +491,5 @@ static inline void bsp_shell_poll(rtos_queue_t *sensor_q, uint32_t latest_temp,
     }
 }
 
+#endif // RTOS_ARCH_RISCV
 #endif // STM32L476_H
