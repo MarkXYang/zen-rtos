@@ -1,7 +1,42 @@
 #include "rtos.h"
 
-// Hardware registers for ARM Cortex-M4 (omitted in host test mode)
-#ifndef RTOS_HOST_TEST
+// Hardware registers for ARM Cortex-M4 vs RISC-V RV32IMAC (omitted in host test mode)
+#if defined(RTOS_HOST_TEST)
+// Host simulation stubs
+#define SCB_CFSR          (0U)
+#define SCB_HFSR          (0U)
+#define SCB_MMFAR         (0U)
+#define SCB_BFAR          (0U)
+
+static inline void rtos_enter_critical(void) {}
+static inline void rtos_exit_critical(void) {}
+static inline void rtos_trigger_pendsv(void) {
+    // In host simulation, immediately complete the context switch
+    extern volatile tcb_t *current_tcb;
+    extern volatile tcb_t *next_tcb;
+    if (next_tcb != NULL) {
+        current_tcb = next_tcb;
+    }
+}
+#elif defined(RTOS_ARCH_RISCV)
+#define CLINT_MSIP_REG    (*(volatile uint32_t *)0x20001C00UL)
+#define SCB_CFSR          ({ uint32_t _v; __asm volatile ("csrr %0, mcause" : "=r"(_v)); _v; })
+#define SCB_HFSR          ({ uint32_t _v; __asm volatile ("csrr %0, mstatus" : "=r"(_v)); _v; })
+#define SCB_MMFAR         ({ uint32_t _v; __asm volatile ("csrr %0, mtval" : "=r"(_v)); _v; })
+#define SCB_BFAR          ({ uint32_t _v; __asm volatile ("csrr %0, mepc" : "=r"(_v)); _v; })
+
+static inline void rtos_enter_critical(void) {
+    __asm volatile ("csrci mstatus, 0x8" : : : "memory");
+}
+
+static inline void rtos_exit_critical(void) {
+    __asm volatile ("csrsi mstatus, 0x8" : : : "memory");
+}
+
+static inline void rtos_trigger_pendsv(void) {
+    CLINT_MSIP_REG = 1UL;
+}
+#else
 #define SCB_ICSR          (*(volatile uint32_t *)0xE000ED04)
 #define SCB_SHPR3         (*(volatile uint32_t *)0xE000ED20)
 #define SCB_CFSR          (*(volatile uint32_t *)0xE000ED28)
@@ -24,23 +59,6 @@ static inline void rtos_exit_critical(void) {
 
 static inline void rtos_trigger_pendsv(void) {
     SCB_ICSR = PENDSVSET_BIT;
-}
-#else
-// Host simulation stubs
-#define SCB_CFSR          (0U)
-#define SCB_HFSR          (0U)
-#define SCB_MMFAR         (0U)
-#define SCB_BFAR          (0U)
-
-static inline void rtos_enter_critical(void) {}
-static inline void rtos_exit_critical(void) {}
-static inline void rtos_trigger_pendsv(void) {
-    // In host simulation, immediately complete the context switch
-    extern volatile tcb_t *current_tcb;
-    extern volatile tcb_t *next_tcb;
-    if (next_tcb != NULL) {
-        current_tcb = next_tcb;
-    }
 }
 #endif
 
@@ -161,6 +179,19 @@ bool rtos_task_create(rtos_task_func_t func, void *arg, uint32_t priority,
     t->run_ticks = 0;
     t->ctx_switches = 0;
 
+#if defined(RTOS_ARCH_RISCV) && !defined(RTOS_HOST_TEST)
+    // Align to 16 bytes per RISC-V ABI and build 32-word (128-byte) initial trap frame
+    uint32_t *sp = (uint32_t *)(((uintptr_t)&stack_buf[stack_size_words - 1]) & ~0xFUL);
+    sp -= 32;
+    for (int i = 0; i < 32; i++) {
+        sp[i] = 0x00000000;
+    }
+    sp[0] = (uint32_t)(uintptr_t)func;                // mepc: Task entry point
+    sp[1] = 0x00001880UL;                             // mstatus: MPP=3 (M-mode), MPIE=1
+    sp[2] = (uint32_t)(uintptr_t)rtos_task_exit_hook; // x1 (ra): Clean exit hook
+    sp[9] = (uint32_t)(uintptr_t)arg;                 // x10 (a0): void *arg parameter
+    t->sp = sp;
+#else
     // Point to top of stack, aligned to 8 bytes
     uint32_t *sp = &stack_buf[stack_size_words - 1];
     sp = (uint32_t *)((uintptr_t)sp & ~0x7);
@@ -182,6 +213,7 @@ bool rtos_task_create(rtos_task_func_t func, void *arg, uint32_t priority,
     }
 
     t->sp = sp;
+#endif
 
     // Mark priority as ready in bitmap
     g_ready_bitmap |= (1UL << priority);
@@ -611,6 +643,9 @@ void rtos_fault_capture(uint32_t *fault_sp) {
 
 #ifndef RTOS_HOST_TEST
 extern void rtos_start_first_task(uint32_t *sp);
+#ifdef RTOS_ARCH_RISCV
+extern void bsp_start_mtimer(uint32_t cpu_freq_hz, uint32_t tick_freq_hz);
+#endif
 
 void rtos_start(uint32_t cpu_freq_hz, uint32_t tick_freq_hz) {
     // Select the highest priority ready task
@@ -625,6 +660,12 @@ void rtos_start(uint32_t cpu_freq_hz, uint32_t tick_freq_hz) {
         }
     }
 
+#ifdef RTOS_ARCH_RISCV
+    bsp_start_mtimer(cpu_freq_hz, tick_freq_hz);
+    // Enable CLINT Machine Software Interrupt (MSIE = bit 3) & Machine Timer Interrupt (MTIE = bit 7)
+    uint32_t mie_mask = (1UL << 3) | (1UL << 7);
+    __asm volatile ("csrs mie, %0" : : "r"(mie_mask));
+#else
     // Set PendSV priority to lowest (0xFF)
     SCB_SHPR3 |= (0xFFUL << 16);
 
@@ -632,6 +673,7 @@ void rtos_start(uint32_t cpu_freq_hz, uint32_t tick_freq_hz) {
     SYST_RVR = (cpu_freq_hz / tick_freq_hz) - 1;
     SYST_CVR = 0;
     SYST_CSR = (1 << 0) | (1 << 1) | (1 << 2); // ENABLE, TICKINT, CLKSOURCE
+#endif
 
     // Jump to the first task
     rtos_start_first_task(current_tcb->sp);
