@@ -101,7 +101,7 @@ flash: build
 		-c "program $(BUILD_DIR)/zen_rtos.elf verify reset exit"
 
 flash-esp32c6: esp32c6
-	python3 scripts/esp32c6_load_ram.py /dev/ttyACM1 $(BUILD_DIR)/zen_rtos_esp32c6.bin
+	python3 scripts/esp32c6_load.py /dev/ttyACM1 $(BUILD_DIR)/zen_rtos_esp32c6.bin
 
 shell:
 	python3 -m serial.tools.miniterm --eol CR /dev/ttyACM0 115200

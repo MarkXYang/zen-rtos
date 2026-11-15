@@ -56,6 +56,11 @@ static volatile uint32_t g_shell_cmd_len = 0;
 
 // Exported for bsp/esp32c6/startup.s (call bsp_disable_watchdogs)
 __attribute__((used)) void bsp_disable_watchdogs(void) {
+    // Ensure CPU clock is switched to 160 MHz SPLL (PCR_SOC_CLK_SEL = 1 in PCR_SYSCLK_CONF_REG)
+    // so both SPI Flash cold-boot and SRAM download mode run at the exact same 160 MHz clock.
+    volatile uint32_t *pcr_sysclk_conf = (volatile uint32_t *)0x60096110UL;
+    *pcr_sysclk_conf = (*pcr_sysclk_conf & ~(3UL << 16)) | (1UL << 16);
+
     // Unlock & disable Timer Group 0 WDT
     TIMG0_WDTWPROTECT_REG = 0x50D83AA1UL;
     TIMG0_WDTCONFIG0_REG  = 0;
