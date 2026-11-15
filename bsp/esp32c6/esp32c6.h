@@ -35,17 +35,22 @@
 // Also mirror output to UART0 (0x60000000)
 #define UART0_FIFO_REG              (*(volatile uint32_t *)0x60000000UL)
 
-// 4. ESP32-C6 GPIO Registers (GPIO8 = Onboard LED on ESP32-C6-Pico)
+// 4. ESP32-C6 GPIO & IO_MUX Registers (GPIO8 = Onboard WS2812B RGB LED on ESP32-C6-Pico)
+#define IO_MUX_BASE                 (0x60090000UL)
+#define IO_MUX_GPIO8_REG            (*(volatile uint32_t *)(IO_MUX_BASE + 0x0024UL))
 #define GPIO_BASE                   (0x60091000UL)
 #define GPIO_OUT_REG                (*(volatile uint32_t *)(GPIO_BASE + 0x0004UL))
 #define GPIO_OUT_W1TS_REG           (*(volatile uint32_t *)(GPIO_BASE + 0x0008UL))
 #define GPIO_OUT_W1TC_REG           (*(volatile uint32_t *)(GPIO_BASE + 0x000CUL))
 #define GPIO_ENABLE_W1TS_REG        (*(volatile uint32_t *)(GPIO_BASE + 0x0024UL))
+#define GPIO_FUNC8_OUT_SEL_CFG_REG  (*(volatile uint32_t *)(GPIO_BASE + 0x0574UL))
 #define LED_GPIO_PIN                8U
 
 extern volatile rtos_fault_info_t g_fault_info;
 
-static uint32_t g_mtimer_step = 16000U; // Default 16 MHz CLINT timer / 1000 Hz = 16000
+static uint32_t g_mtimer_step = 160000U;
+static volatile bool g_led_state = false;
+static volatile uint32_t g_led_color_grb = 0x200000UL; // Default bright green (G=0x20, R=0x00, B=0x00)
 static char     g_shell_cmd_buf[64];
 static volatile uint32_t g_shell_cmd_len = 0;
 
@@ -81,28 +86,51 @@ __attribute__((used)) void bsp_start_mtimer(uint32_t cpu_freq_hz, uint32_t tick_
     bsp_ack_mtimer();
 }
 
-static inline void bsp_init_led(void) {
-    GPIO_ENABLE_W1TS_REG = (1UL << LED_GPIO_PIN);
+// Bare-metal 800 kHz WS2812B RGB NeoPixel driver on GPIO8 using 160 MHz CLINT_MTIME_LO (6.25 ns/tick)
+static inline void bsp_ws2812_write_grb(uint32_t grb) {
+    const uint32_t pin_mask = (1UL << LED_GPIO_PIN);
+    uint32_t mstatus;
+    __asm volatile ("csrrci %0, mstatus, 0x8" : "=r"(mstatus) : : "memory");
+
+    for (int bit = 23; bit >= 0; bit--) {
+        uint32_t is_one = (grb >> bit) & 1U;
+        uint32_t t_high = is_one ? 128U : 64U; // 800 ns ('1') vs 400 ns ('0') at 160 MHz
+        uint32_t t_low  = is_one ? 72U  : 136U; // 450 ns ('1') vs 850 ns ('0') at 160 MHz
+
+        uint32_t t0 = CLINT_MTIME_LO;
+        GPIO_OUT_W1TS_REG = pin_mask;
+        while ((CLINT_MTIME_LO - t0) < t_high) {}
+
+        t0 = CLINT_MTIME_LO;
+        GPIO_OUT_W1TC_REG = pin_mask;
+        while ((CLINT_MTIME_LO - t0) < t_low) {}
+    }
+
+    if (mstatus & 0x8U) {
+        __asm volatile ("csrsi mstatus, 0x8" : : : "memory");
+    }
 }
 
-static inline void bsp_toggle_led(void) {
-    if (GPIO_OUT_REG & (1UL << LED_GPIO_PIN)) {
-        GPIO_OUT_W1TC_REG = (1UL << LED_GPIO_PIN);
-    } else {
-        GPIO_OUT_W1TS_REG = (1UL << LED_GPIO_PIN);
-    }
+static inline void bsp_init_led(void) {
+    // Route GPIO8 pad to simple GPIO output (MCU_SEL=1, FUN_DRV=2)
+    IO_MUX_GPIO8_REG = (1UL << 12) | (2UL << 10);
+    GPIO_FUNC8_OUT_SEL_CFG_REG = 0x100UL;
+    GPIO_OUT_W1TC_REG = (1UL << LED_GPIO_PIN);
+    GPIO_ENABLE_W1TS_REG = (1UL << LED_GPIO_PIN);
+    bsp_ws2812_write_grb(0x000000UL);
 }
 
 static inline void bsp_set_led(bool on) {
-    if (on) {
-        GPIO_OUT_W1TS_REG = (1UL << LED_GPIO_PIN);
-    } else {
-        GPIO_OUT_W1TC_REG = (1UL << LED_GPIO_PIN);
-    }
+    g_led_state = on;
+    bsp_ws2812_write_grb(on ? g_led_color_grb : 0x000000UL);
+}
+
+static inline void bsp_toggle_led(void) {
+    bsp_set_led(!g_led_state);
 }
 
 static inline bool bsp_get_led(void) {
-    return (GPIO_OUT_REG & (1UL << LED_GPIO_PIN)) != 0;
+    return g_led_state;
 }
 
 static inline void bsp_init_uart(uint32_t _cpu_freq_hz, uint32_t _baud) {
@@ -297,8 +325,9 @@ static inline void bsp_shell_exec(const char *raw_cmd, rtos_queue_t *sensor_q,
         bsp_uart_puts("  trace           - Dump recent kernel trace ring buffer events\n");
         bsp_uart_puts("  sensor / temp   - Read latest sensor temperature & IPC queue count\n");
         bsp_uart_puts("  mem / stack     - Check stack canary (0xDEADBEEF) & high-water marks\n");
-        bsp_uart_puts("  led on|off      - Turn GPIO8 LED ON or OFF (manual override)\n");
-        bsp_uart_puts("  led toggle      - Toggle GPIO8 LED state\n");
+        bsp_uart_puts("  led on|off      - Turn GPIO8 WS2812 RGB LED ON or OFF (manual override)\n");
+        bsp_uart_puts("  led toggle      - Toggle GPIO8 WS2812 RGB LED state\n");
+        bsp_uart_puts("  led red|green|blue - Set WS2812 RGB LED color\n");
         bsp_uart_puts("  led blink       - Resume automatic 1 Hz RTOS LED blinking task\n");
         bsp_uart_puts("  log on|off      - Enable/disable periodic telemetry console stream\n");
         bsp_uart_puts("  fault           - Show RISC-V post-mortem exception CSR record\n");
@@ -330,7 +359,7 @@ static inline void bsp_shell_exec(const char *raw_cmd, rtos_queue_t *sensor_q,
             bsp_uart_putdec(buf[idx].arg2);
             bsp_uart_puts("\n");
         }
-    } else if (bsp_streq(cmd, "sensor") || bsp_streq(cmd, "temp") || bsp_streq(cmd, "queue")) {
+    } else if (bsp_streq(cmd, "sensor") || bsp_streq(cmd, "temp") || bsp_streq(cmd, "queue") || bsp_streq(cmd, "queues")) {
         bsp_uart_puts("Sensor Temperature : ");
         bsp_uart_putdec(latest_temp);
         bsp_uart_puts(" C\n");
@@ -339,7 +368,7 @@ static inline void bsp_shell_exec(const char *raw_cmd, rtos_queue_t *sensor_q,
         bsp_uart_puts(" / ");
         bsp_uart_putdec(sensor_q ? sensor_q->capacity : 0);
         bsp_uart_puts(" msgs\n");
-        bsp_uart_puts("Onboard LED (GPIO8): ");
+        bsp_uart_puts("Onboard RGB (GPIO8): ");
         bsp_uart_puts(bsp_get_led() ? "ON" : "OFF");
         bsp_uart_puts((*led_auto_blink) ? " (Auto-Blink 1Hz)\n" : " (Manual Override)\n");
     } else if (bsp_streq(cmd, "mem") || bsp_streq(cmd, "stack")) {
@@ -355,18 +384,30 @@ static inline void bsp_shell_exec(const char *raw_cmd, rtos_queue_t *sensor_q,
     } else if (bsp_streq(cmd, "led on") || bsp_streq(cmd, "ledon")) {
         *led_auto_blink = 0;
         bsp_set_led(true);
-        bsp_uart_puts("LED (GPIO8) set to ON.\n");
+        bsp_uart_puts("WS2812 RGB LED (GPIO8) set to ON.\n");
     } else if (bsp_streq(cmd, "led off") || bsp_streq(cmd, "ledoff")) {
         *led_auto_blink = 0;
         bsp_set_led(false);
-        bsp_uart_puts("LED (GPIO8) set to OFF.\n");
+        bsp_uart_puts("WS2812 RGB LED (GPIO8) set to OFF.\n");
     } else if (bsp_streq(cmd, "led toggle") || bsp_streq(cmd, "ledtoggle")) {
         *led_auto_blink = 0;
         bsp_toggle_led();
-        bsp_uart_puts("LED (GPIO8) toggled.\n");
+        bsp_uart_puts("WS2812 RGB LED (GPIO8) toggled.\n");
+    } else if (bsp_streq(cmd, "led red")) {
+        g_led_color_grb = 0x002000UL;
+        bsp_set_led(true);
+        bsp_uart_puts("WS2812 RGB LED color set to RED.\n");
+    } else if (bsp_streq(cmd, "led green")) {
+        g_led_color_grb = 0x200000UL;
+        bsp_set_led(true);
+        bsp_uart_puts("WS2812 RGB LED color set to GREEN.\n");
+    } else if (bsp_streq(cmd, "led blue")) {
+        g_led_color_grb = 0x000020UL;
+        bsp_set_led(true);
+        bsp_uart_puts("WS2812 RGB LED color set to BLUE.\n");
     } else if (bsp_streq(cmd, "led blink") || bsp_streq(cmd, "ledblink")) {
         *led_auto_blink = 1;
-        bsp_uart_puts("LED (GPIO8) returned to automatic 1 Hz RTOS blink.\n");
+        bsp_uart_puts("WS2812 RGB LED (GPIO8) returned to automatic 1 Hz RTOS blink.\n");
     } else if (bsp_streq(cmd, "log on") || bsp_streq(cmd, "logon") || bsp_streq(cmd, "log 1")) {
         *telemetry_log_on = 1;
         bsp_uart_puts("Periodic telemetry broadcast ENABLED.\n");
