@@ -110,8 +110,8 @@ rtos_start_first_task:
 riscv_msip_handler:
     SAVE_CONTEXT
 
-    /* Clear CLINT MSIP register (0x20001C00 = 0) */
-    li    t0, 0x20001C00
+    /* Clear CLINT MSIP register (0x20001800 = 0) */
+    li    t0, 0x20001800
     sw    zero, 0(t0)
 
     /* Save outgoing sp to current_tcb->sp */
@@ -119,13 +119,16 @@ riscv_msip_handler:
     lw    t1, 0(t0)
     sw    sp, 0(t1)
 
-    /* Switch current_tcb = next_tcb */
+    /* Switch current_tcb = next_tcb (if non-null) */
     la    t2, next_tcb
     lw    t3, 0(t2)
+    beqz  t3, 1f
+    sw    zero, 0(t2)
     sw    t3, 0(t0)
-
-    /* Load incoming sp from next_tcb->sp */
-    lw    sp, 0(t3)
+    mv    t1, t3
+1:
+    /* Load incoming sp from current_tcb->sp */
+    lw    sp, 0(t1)
 
     RESTORE_CONTEXT
     mret
@@ -150,8 +153,12 @@ riscv_mtimer_handler:
     la    t2, next_tcb
     lw    t3, 0(t2)
     beqz  t3, 1f
+    sw    zero, 0(t2)
     sw    t3, 0(t0)
     mv    t1, t3
+    /* Also clear pending MSIP (0x20001800) since we already switched here */
+    li    t4, 0x20001800
+    sw    zero, 0(t4)
 1:
     lw    sp, 0(t1)
     RESTORE_CONTEXT

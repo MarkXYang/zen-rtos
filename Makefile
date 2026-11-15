@@ -38,7 +38,7 @@ LDFLAGS_ESP32C6 ?= --target=riscv32-unknown-elf -march=rv32imac -mabi=ilp32 \
 
 BUILD_DIR     := build
 
-.PHONY: all build esp32c6 test zenc flash shell clean
+.PHONY: all build esp32c6 test zenc flash flash-esp32c6 shell shell-esp32c6 clean
 
 all: build
 
@@ -100,8 +100,14 @@ flash: build
 	openocd -f interface/stlink.cfg -f target/stm32l4x.cfg \
 		-c "program $(BUILD_DIR)/zen_rtos.elf verify reset exit"
 
+flash-esp32c6: esp32c6
+	python3 scripts/esp32c6_load_ram.py /dev/ttyACM1 $(BUILD_DIR)/zen_rtos_esp32c6.bin
+
 shell:
 	python3 -m serial.tools.miniterm --eol CR /dev/ttyACM0 115200
+
+shell-esp32c6:
+	python3 -m serial.tools.miniterm --eol CR /dev/ttyACM1 115200
 
 clean:
 	rm -rf $(BUILD_DIR) app/main_zc.c

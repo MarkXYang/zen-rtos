@@ -19,7 +19,7 @@ static inline void rtos_trigger_pendsv(void) {
     }
 }
 #elif defined(RTOS_ARCH_RISCV)
-#define CLINT_MSIP_REG    (*(volatile uint32_t *)0x20001C00UL)
+#define CLINT_MSIP_REG    (*(volatile uint32_t *)0x20001800UL)
 #define SCB_CFSR          ({ uint32_t _v; __asm volatile ("csrr %0, mcause" : "=r"(_v)); _v; })
 #define SCB_HFSR          ({ uint32_t _v; __asm volatile ("csrr %0, mstatus" : "=r"(_v)); _v; })
 #define SCB_MMFAR         ({ uint32_t _v; __asm volatile ("csrr %0, mtval" : "=r"(_v)); _v; })
@@ -357,6 +357,10 @@ bool rtos_sem_wait(rtos_sem_t *sem, uint32_t timeout_ticks) {
     rtos_exit_critical();
 
     rtos_schedule();
+
+#ifndef RTOS_HOST_TEST
+    while (t->state == TASK_STATE_BLOCKED) {}
+#endif
 
     return (t->sleep_ticks > 0 || timeout_ticks == 0);
 }

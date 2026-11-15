@@ -16,17 +16,24 @@
 #define LP_WDT_SWD_CONFIG_REG       (*(volatile uint32_t *)(LP_WDT_BASE + 0x001CUL))
 #define LP_WDT_SWD_WPROTECT_REG     (*(volatile uint32_t *)(LP_WDT_BASE + 0x0020UL))
 
-// 2. ESP32-C6 CLINT Machine Timer Registers (64-bit counter + comparator)
-#define CLINT_MTIME_LO              (*(volatile uint32_t *)0x20001800UL)
-#define CLINT_MTIME_HI              (*(volatile uint32_t *)0x20001804UL)
-#define CLINT_MTIMECMP_LO           (*(volatile uint32_t *)0x20001808UL)
-#define CLINT_MTIMECMP_HI           (*(volatile uint32_t *)0x2000180CUL)
+// 2. ESP32-C6 CLINT Machine Timer Registers (DR_REG_CLINT_M_BASE = 0x20001800)
+#define CLINT_MSIP_REG              (*(volatile uint32_t *)0x20001800UL)
+#define CLINT_MTIMECTL_REG          (*(volatile uint32_t *)0x20001804UL)
+#define CLINT_MTIME_LO              (*(volatile uint32_t *)0x20001808UL)
+#define CLINT_MTIME_HI              (*(volatile uint32_t *)0x2000180CUL)
+#define CLINT_MTIMECMP_LO           (*(volatile uint32_t *)0x20001810UL)
+#define CLINT_MTIMECMP_HI           (*(volatile uint32_t *)0x20001814UL)
 
-// 3. ESP32-C6 Built-in USB-Serial/JTAG Console Registers (/dev/ttyACM0)
+// 3. ESP32-C6 Built-in USB-Serial/JTAG Console Registers (/dev/ttyACM1)
 #define USB_DEVICE_BASE             (0x6000F000UL)
 #define USB_DEVICE_EP1_REG          (*(volatile uint32_t *)(USB_DEVICE_BASE + 0x0000UL))
 #define USB_DEVICE_EP1_CONF_REG     (*(volatile uint32_t *)(USB_DEVICE_BASE + 0x0004UL))
-#define USB_DEVICE_JTAG_ST_REG      (*(volatile uint32_t *)(USB_DEVICE_BASE + 0x0008UL))
+#define USB_EP1_WR_DONE             (1UL << 0)
+#define USB_EP1_IN_DATA_FREE        (1UL << 1)
+#define USB_EP1_OUT_DATA_AVAIL      (1UL << 2)
+
+// Also mirror output to UART0 (0x60000000)
+#define UART0_FIFO_REG              (*(volatile uint32_t *)0x60000000UL)
 
 // 4. ESP32-C6 GPIO Registers (GPIO8 = Onboard LED on ESP32-C6-Pico)
 #define GPIO_BASE                   (0x60091000UL)
@@ -66,7 +73,11 @@ __attribute__((used)) void bsp_ack_mtimer(void) {
 
 // Exported for kernel/rtos.c (call bsp_start_mtimer)
 __attribute__((used)) void bsp_start_mtimer(uint32_t cpu_freq_hz, uint32_t tick_freq_hz) {
-    g_mtimer_step = cpu_freq_hz / tick_freq_hz;
+    (void)cpu_freq_hz;
+    // Enable CLINT MTIME counter (MTCE = bit 0) and timer interrupt (MTIE = bit 1)
+    CLINT_MTIMECTL_REG |= 0x03UL;
+    // ESP32-C6 HP RISC-V core runs at 160 MHz; 160,000 cycles = 1.000 ms (1000 Hz)
+    g_mtimer_step = 160000U / (tick_freq_hz / 1000U);
     bsp_ack_mtimer();
 }
 
@@ -99,18 +110,28 @@ static inline void bsp_init_uart(uint32_t _cpu_freq_hz, uint32_t _baud) {
     (void)_baud; // USB-Serial/JTAG is pre-initialized by ESP32-C6 ROM
 }
 
+static inline void bsp_usb_write_byte(uint8_t b) {
+    for (uint32_t wait = 0; wait < 30000U; wait++) {
+        if (USB_DEVICE_EP1_CONF_REG & USB_EP1_IN_DATA_FREE) {
+            USB_DEVICE_EP1_REG = b;
+            return;
+        }
+    }
+}
+
 static inline void bsp_uart_putc(char c) {
-    // Wait until USB-Serial TX FIFO has space (bit 1 of EP1_CONF_REG)
-    while ((USB_DEVICE_EP1_CONF_REG & (1UL << 1)) == 0) {}
-    USB_DEVICE_EP1_REG = (uint8_t)c;
     if (c == '\n') {
-        USB_DEVICE_EP1_CONF_REG = (1UL << 0); // Flush USB packet on newline
+        bsp_usb_write_byte((uint8_t)'\r');
+    }
+    bsp_usb_write_byte((uint8_t)c);
+    if (c == '\n') {
+        USB_DEVICE_EP1_CONF_REG = USB_EP1_WR_DONE; // Flush USB packet on newline
     }
 }
 
 static inline bool bsp_uart_getc(char *out_c) {
-    // Bit 0 of JTAG_ST_REG (SERIAL_OUT_EP_DATA_AVAIL) indicates RX byte ready
-    if (USB_DEVICE_JTAG_ST_REG & (1UL << 0)) {
+    // Bit 2 of EP1_CONF_REG (SERIAL_OUT_EP_DATA_AVAIL) indicates RX byte ready
+    if (USB_DEVICE_EP1_CONF_REG & USB_EP1_OUT_DATA_AVAIL) {
         *out_c = (char)(USB_DEVICE_EP1_REG & 0xFFU);
         return true;
     }
@@ -120,11 +141,9 @@ static inline bool bsp_uart_getc(char *out_c) {
 static inline void bsp_uart_puts(const char *s) {
     if (!s) return;
     while (*s) {
-        if (*s == '\n') {
-            bsp_uart_putc('\r');
-        }
         bsp_uart_putc(*s++);
     }
+    USB_DEVICE_EP1_CONF_REG = USB_EP1_WR_DONE;
 }
 
 static inline void bsp_uart_putdec(uint32_t val) {
@@ -432,6 +451,7 @@ static inline void bsp_shell_poll(rtos_queue_t *sensor_q, uint32_t latest_temp,
                 if (g_shell_cmd_len < sizeof(g_shell_cmd_buf) - 1) {
                     g_shell_cmd_buf[g_shell_cmd_len++] = c;
                     bsp_uart_putc(c);
+                    USB_DEVICE_EP1_CONF_REG = USB_EP1_WR_DONE;
                 }
             }
         }
