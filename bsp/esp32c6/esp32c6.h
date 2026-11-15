@@ -86,34 +86,48 @@ __attribute__((used)) void bsp_start_mtimer(uint32_t cpu_freq_hz, uint32_t tick_
     bsp_ack_mtimer();
 }
 
-// Bare-metal 800 kHz WS2812B RGB NeoPixel driver on GPIO8 using 160 MHz CLINT_MTIME_LO (6.25 ns/tick)
+// Bare-metal 800 kHz WS2812B-0807 RGB NeoPixel driver on GPIO8 (160 MHz RISC-V core)
+// WS2812B-0807 strict timing:
+//   '0' bit: T0H = 220..380 ns (~250 ns), T0L = 580..1000 ns (~850 ns)
+//   '1' bit: T1H = 580..1000 ns (~750 ns), T1L = 580..1000 ns (~650 ns)
+//   Reset/Latch: > 80 us LOW
 static inline void bsp_ws2812_write_grb(uint32_t grb) {
     const uint32_t pin_mask = (1UL << LED_GPIO_PIN);
     uint32_t mstatus;
     __asm volatile ("csrrci %0, mstatus, 0x8" : "=r"(mstatus) : : "memory");
 
-    // Ensure GPIO8 is low for >80 us (12,800 ticks at 160 MHz) before frame to latch/reset WS2812B
+    // Ensure GPIO8 is low for >100 us before frame
     GPIO_OUT_W1TC_REG = pin_mask;
     uint32_t t_rst = CLINT_MTIME_LO;
-    while ((CLINT_MTIME_LO - t_rst) < 12800U) {}
+    while ((CLINT_MTIME_LO - t_rst) < 16000U) {}
 
     for (int bit = 23; bit >= 0; bit--) {
-        uint32_t is_one = (grb >> bit) & 1U;
-        uint32_t t_high = is_one ? 128U : 64U; // 800 ns ('1') vs 400 ns ('0') at 160 MHz
-        uint32_t t_low  = is_one ? 72U  : 136U; // 450 ns ('1') vs 850 ns ('0') at 160 MHz
-
-        uint32_t t0 = CLINT_MTIME_LO;
-        GPIO_OUT_W1TS_REG = pin_mask;
-        while ((CLINT_MTIME_LO - t0) < t_high) {}
-
-        t0 = CLINT_MTIME_LO;
-        GPIO_OUT_W1TC_REG = pin_mask;
-        while ((CLINT_MTIME_LO - t0) < t_low) {}
+        if ((grb >> bit) & 1U) {
+            // '1' bit: ~750 ns HIGH, ~650 ns LOW
+            uint32_t t0 = CLINT_MTIME_LO;
+            GPIO_OUT_W1TS_REG = pin_mask;
+            while ((CLINT_MTIME_LO - t0) < 110U) {}
+            GPIO_OUT_W1TC_REG = pin_mask;
+            t0 = CLINT_MTIME_LO;
+            while ((CLINT_MTIME_LO - t0) < 105U) {}
+        } else {
+            // '0' bit: ~250 ns HIGH (24 nops at 160 MHz), ~850 ns LOW
+            GPIO_OUT_W1TS_REG = pin_mask;
+            __asm volatile (
+                ".rept 24\n\t"
+                "nop\n\t"
+                ".endr\n\t"
+                : : : "memory"
+            );
+            GPIO_OUT_W1TC_REG = pin_mask;
+            uint32_t t0 = CLINT_MTIME_LO;
+            while ((CLINT_MTIME_LO - t0) < 135U) {}
+        }
     }
 
-    // Hold low for >80 us after frame so WS2812B latches the 24-bit color
+    // Hold low for >100 us after frame so WS2812B-0807 latches the 24-bit color
     t_rst = CLINT_MTIME_LO;
-    while ((CLINT_MTIME_LO - t_rst) < 12800U) {}
+    while ((CLINT_MTIME_LO - t_rst) < 16000U) {}
 
     if (mstatus & 0x8U) {
         __asm volatile ("csrsi mstatus, 0x8" : : : "memory");
