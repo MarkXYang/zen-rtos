@@ -419,7 +419,7 @@ static inline void bsp_shell_exec(const char *raw_cmd, rtos_queue_t *sensor_q,
         bsp_toggle_led();
         bsp_uart_puts("WS2812 RGB LED (GPIO8) toggled.\n");
     } else if (bsp_streq(cmd, "led red")) {
-        g_led_color_grb = 0x002000UL;
+        g_led_color_grb = 0x000020UL;
         bsp_set_led(true);
         bsp_uart_puts("WS2812 RGB LED color set to RED.\n");
     } else if (bsp_streq(cmd, "led green")) {
@@ -427,7 +427,7 @@ static inline void bsp_shell_exec(const char *raw_cmd, rtos_queue_t *sensor_q,
         bsp_set_led(true);
         bsp_uart_puts("WS2812 RGB LED color set to GREEN.\n");
     } else if (bsp_streq(cmd, "led blue")) {
-        g_led_color_grb = 0x000020UL;
+        g_led_color_grb = 0x002000UL;
         bsp_set_led(true);
         bsp_uart_puts("WS2812 RGB LED color set to BLUE.\n");
     } else if (bsp_streq(cmd, "led blink") || bsp_streq(cmd, "ledblink")) {
