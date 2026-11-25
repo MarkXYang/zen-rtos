@@ -14,11 +14,13 @@ extern "C" {
 #define RTOS_DEFAULT_STACK_SIZE 256          // In 32-bit words (1024 bytes)
 #define RTOS_STACK_CANARY       0xDEADBEEFUL // Stack watermark & overflow guard pattern
 #define RTOS_TRACE_BUFFER_SIZE  64           // Circular kernel trace buffer entries
+#define RTOS_WAIT_FOREVER       0xFFFFFFFFUL // Infinite blocking timeout sentinel
 
 typedef enum {
     TASK_STATE_READY = 0,
     TASK_STATE_BLOCKED,
-    TASK_STATE_SUSPENDED
+    TASK_STATE_SUSPENDED,
+    TASK_STATE_UNUSED
 } task_state_t;
 
 typedef void (*rtos_task_func_t)(void *arg);
@@ -126,19 +128,46 @@ typedef struct {
     rtos_sem_t          slots_free;          // Signals producers when space frees up
 } rtos_queue_t;
 
+// Software Timer
+typedef void (*rtos_timer_cb_t)(void *arg);
+
+typedef struct rtos_timer {
+    rtos_timer_cb_t     callback;
+    void               *arg;
+    uint32_t            period_ticks;
+    uint32_t            expire_tick;
+    bool                periodic;
+    bool                active;
+    struct rtos_timer  *next;
+} rtos_timer_t;
+
 // Kernel Public API
 void        rtos_init(void);
 bool        rtos_task_create(rtos_task_func_t func, void *arg, uint32_t priority,
                              uint32_t *stack_buf, uint32_t stack_size_words, const char *name);
+tcb_t      *rtos_task_create_ex(rtos_task_func_t func, void *arg, uint32_t priority,
+                                uint32_t *stack_buf, uint32_t stack_size_words, const char *name);
+void        rtos_task_delete(tcb_t *task);
+tcb_t      *rtos_get_current_task(void);
 void        rtos_start(uint32_t cpu_freq_hz, uint32_t tick_freq_hz);
 void        rtos_delay(uint32_t ticks);
 void        rtos_yield(void);
 uint32_t    rtos_get_tick(void);
 
+// State-saving IRQ Critical Sections (safe inside ISRs and nested calls)
+uint32_t    rtos_irq_save(void);
+void        rtos_irq_restore(uint32_t flags);
+
 // Synchronization & IPC API
 void        rtos_sem_init(rtos_sem_t *sem, int32_t initial_count, int32_t max_count);
 bool        rtos_sem_wait(rtos_sem_t *sem, uint32_t timeout_ticks);
 void        rtos_sem_signal(rtos_sem_t *sem);
+void        rtos_sem_signal_from_isr(rtos_sem_t *sem, bool *higher_prio_woken);
+
+// Software Timer API
+void        rtos_timer_init(rtos_timer_t *timer, rtos_timer_cb_t cb, void *arg);
+void        rtos_timer_start(rtos_timer_t *timer, uint32_t delay_ticks, bool periodic);
+void        rtos_timer_stop(rtos_timer_t *timer);
 
 void        rtos_mutex_init(rtos_mutex_t *mutex);
 bool        rtos_mutex_lock(rtos_mutex_t *mutex, uint32_t timeout_ticks);

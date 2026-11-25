@@ -39,6 +39,38 @@ LDFLAGS_ESP32C6 ?= --target=riscv32-unknown-elf -march=rv32imac -mabi=ilp32 \
                    -Wl,-T,bsp/esp32c6/link.ld \
                    -Wl,--gc-sections
 
+# ESP32-C6-Pico Wi-Fi Build Flags (Direct-Boot Flash XIP + Espressif Wi-Fi/PHY blobs)
+ESP32C6_WIFI_DIR := third_party/esp32c6_wifi
+CFLAGS_ESP32C6_WIFI ?= --target=riscv32-unknown-elf -march=rv32imac_zicsr_zifencei -mabi=ilp32 \
+                       -mcmodel=medany -O2 -Wall -Wextra -ffreestanding \
+                       -Wno-unused-parameter -Wno-unused-variable -Wno-unused-function \
+                       -Wno-parentheses-equality \
+                       -DRTOS_ARCH_RISCV -DZC_FUNC= -DZC_GLOBAL= \
+                       -Ikernel/include -Ibsp/esp32c6 -Iarch/riscv/rv32 \
+                       -fdata-sections -ffunction-sections
+
+LDFLAGS_ESP32C6_WIFI ?= --target=riscv32-unknown-elf -march=rv32imac_zicsr_zifencei -mabi=ilp32 \
+                        -nostdlib -fuse-ld=lld \
+                        -Wl,-T,bsp/esp32c6/link_wifi.ld \
+                        -Wl,-T,$(ESP32C6_WIFI_DIR)/ld/esp32c6.rom.ld \
+                        -Wl,-T,$(ESP32C6_WIFI_DIR)/ld/esp32c6.rom.api.ld \
+                        -Wl,-T,$(ESP32C6_WIFI_DIR)/ld/esp32c6.rom.libgcc.ld \
+                        -Wl,-T,$(ESP32C6_WIFI_DIR)/ld/esp32c6.rom.phy.ld \
+                        -Wl,-T,$(ESP32C6_WIFI_DIR)/ld/esp32c6.rom.coexist.ld \
+                        -Wl,-T,$(ESP32C6_WIFI_DIR)/ld/esp32c6.rom.net80211.ld \
+                        -Wl,-T,$(ESP32C6_WIFI_DIR)/ld/esp32c6.rom.pp.ld \
+                        -Wl,-T,$(ESP32C6_WIFI_DIR)/ld/esp32c6.rom.systimer.ld \
+                        -Wl,--gc-sections
+
+ESP32C6_WIFI_LIBS := -Wl,--start-group \
+                     $(ESP32C6_WIFI_DIR)/lib/libnet80211.a \
+                     $(ESP32C6_WIFI_DIR)/lib/libpp.a \
+                     $(ESP32C6_WIFI_DIR)/lib/libcore.a \
+                     $(ESP32C6_WIFI_DIR)/lib/libcoexist.a \
+                     $(ESP32C6_WIFI_DIR)/lib/libphy.a \
+                     $(ESP32C6_WIFI_DIR)/lib/libbtbb.a \
+                     -Wl,--end-group
+
 # NXP i.MX RT1021 Target Flags (Clang bare-metal ARM Cortex-M7)
 # Set RT1021_BOOT=ram for OCRAM/DTCM RAM-load bring-up, or xip (default) for FlexSPI QSPI NOR
 RT1021_BOOT     ?= xip
@@ -60,7 +92,7 @@ LDFLAGS_RT1021  ?= --target=$(TARGET_TRIPLE) -mcpu=cortex-m7 -mthumb \
 
 BUILD_DIR     := build
 
-.PHONY: all build esp32c6 rt1021 test zenc flash flash-esp32c6 flash-rt1021 shell shell-esp32c6 shell-rt1021 clean
+.PHONY: all build esp32c6 esp32c6-wifi rt1021 test zenc flash flash-esp32c6 flash-esp32c6-wifi flash-rt1021 shell shell-esp32c6 shell-rt1021 clean
 
 all: build
 
@@ -93,6 +125,11 @@ $(BUILD_DIR)/esp32c6_zc.c: bsp/esp32c6/esp32c6.zc kernel/include/rtos.h
 	@mkdir -p $(BUILD_DIR)
 	@echo "--- Transpiling Zen-C ESP32-C6 BSP (bsp/esp32c6/esp32c6.zc) to C ---"
 	$(ZC) transpile --freestanding bsp/esp32c6/esp32c6.zc -Ikernel/include -o $(BUILD_DIR)/esp32c6_zc.c
+
+$(BUILD_DIR)/esp32c6_wifi_zc.c: bsp/esp32c6/wifi.zc kernel/include/rtos.h
+	@mkdir -p $(BUILD_DIR)
+	@echo "--- Transpiling Zen-C ESP32-C6 Wi-Fi Module (bsp/esp32c6/wifi.zc) to C ---"
+	$(ZC) transpile --freestanding bsp/esp32c6/wifi.zc -Ikernel/include -o $(BUILD_DIR)/esp32c6_wifi_zc.c
 
 $(BUILD_DIR)/rt1021_zc.c: bsp/rt1021/rt1021.zc kernel/include/rtos.h
 	@mkdir -p $(BUILD_DIR)
@@ -136,6 +173,31 @@ $(BUILD_DIR)/zen_rtos_esp32c6.bin: $(BUILD_DIR)/zen_rtos_esp32c6.elf
 	$(LLVM_OBJCOPY) -O binary $< $@
 
 # ----------------------------------------------------------------------
+# Target 4b: ESP32-C6-Pico Wi-Fi Build (Direct-Boot Flash XIP + Blobs)
+# ----------------------------------------------------------------------
+esp32c6-wifi: $(BUILD_DIR)/zen_rtos_esp32c6_wifi.bin $(BUILD_DIR)/zen_rtos_esp32c6_wifi.elf
+	@echo "--- ESP32-C6-Pico Wi-Fi (Direct-Boot XIP) ZenRTOS Build Complete ---"
+	@ls -lh $(BUILD_DIR)/zen_rtos_esp32c6_wifi.elf $(BUILD_DIR)/zen_rtos_esp32c6_wifi.bin
+
+$(BUILD_DIR)/zen_rtos_esp32c6_wifi.elf: kernel/rtos.c \
+                                        arch/riscv/rv32/context.s \
+                                        bsp/esp32c6/startup.s \
+                                        bsp/esp32c6/wifi_heap.c \
+                                        bsp/esp32c6/wifi_libc.c \
+                                        bsp/esp32c6/wifi_osi.c \
+                                        $(BUILD_DIR)/esp32c6_zc.c \
+                                        $(BUILD_DIR)/esp32c6_wifi_zc.c \
+                                        app/main_zc.c
+	@if [ ! -f "$(ESP32C6_WIFI_DIR)/lib/libnet80211.a" ]; then \
+		./scripts/fetch_esp32c6_wifi_blobs.sh; \
+	fi
+	@mkdir -p $(BUILD_DIR)
+	$(CLANG) $(CFLAGS_ESP32C6_WIFI) $(LDFLAGS_ESP32C6_WIFI) $^ $(ESP32C6_WIFI_LIBS) -o $@
+
+$(BUILD_DIR)/zen_rtos_esp32c6_wifi.bin: $(BUILD_DIR)/zen_rtos_esp32c6_wifi.elf
+	$(LLVM_OBJCOPY) -O binary $< $@
+
+# ----------------------------------------------------------------------
 # Target 5: NXP i.MX RT1021 Bare-Metal Cortex-M7 Build (XIP or RAM)
 # ----------------------------------------------------------------------
 rt1021: $(BUILD_DIR)/zen_rtos_rt1021.bin $(BUILD_DIR)/zen_rtos_rt1021.elf
@@ -161,6 +223,9 @@ flash: build
 
 flash-esp32c6: esp32c6
 	python3 scripts/esp32c6_load.py /dev/ttyACM1 $(BUILD_DIR)/zen_rtos_esp32c6.bin
+
+flash-esp32c6-wifi: esp32c6-wifi
+	python3 scripts/esp32c6_load.py /dev/ttyACM1 $(BUILD_DIR)/zen_rtos_esp32c6_wifi.bin --raw-flash
 
 flash-rt1021: rt1021
 	@if [ "$(RT1021_BOOT)" = "ram" ]; then \

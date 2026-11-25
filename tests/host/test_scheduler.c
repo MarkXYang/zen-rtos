@@ -291,6 +291,113 @@ static void test_message_queue_ipc(void) {
     printf("         FIFO ordering & semaphore-backed queue count verified. [PASS]\n");
 }
 
+// -------------------------------------------------------------------------
+// Test 10: Non-Blocking Poll (timeout=0) vs RTOS_WAIT_FOREVER
+// -------------------------------------------------------------------------
+static void test_sem_and_mutex_timeouts(void) {
+    printf("[TEST 10] Verifying non-blocking timeout=0 vs RTOS_WAIT_FOREVER...\n");
+    rtos_init();
+
+    rtos_sem_t sem;
+    rtos_sem_init(&sem, 0, 1);
+    rtos_task_create(dummy_task1, NULL, 5, stack_t1, 256, "T10");
+    rtos_start(1000, 1000);
+
+    // timeout=0 on empty semaphore must fail immediately without blocking
+    assert(rtos_sem_wait(&sem, 0) == false);
+    assert(current_tcb->state == TASK_STATE_READY);
+
+    // Non-blocking mutex try-lock when held by another task must return false
+    rtos_mutex_t mtx;
+    rtos_mutex_init(&mtx);
+    rtos_task_create(dummy_task2, NULL, 6, stack_t2, 256, "T10b");
+    tcb_t *t1 = (tcb_t *)rtos_get_task_by_id(2);
+    tcb_t *t2 = (tcb_t *)rtos_get_task_by_id(3);
+    current_tcb = t1;
+    assert(rtos_mutex_lock(&mtx, 0) == true);
+    current_tcb = t2;
+    assert(rtos_mutex_lock(&mtx, 0) == false);
+    assert(t2->state == TASK_STATE_READY);
+    printf("          Non-blocking sem/mutex try-lock verified. [PASS]\n");
+}
+
+// -------------------------------------------------------------------------
+// Test 11: Shared-Priority Round-Robin & Task Deletion Slot Reuse
+// -------------------------------------------------------------------------
+static void test_round_robin_and_task_delete(void) {
+    printf("[TEST 11] Verifying equal-priority round-robin & rtos_task_delete()...\n");
+    rtos_init();
+
+    tcb_t *a = rtos_task_create_ex(dummy_task1, NULL, 5, stack_t1, 256, "RR_A");
+    tcb_t *b = rtos_task_create_ex(dummy_task2, NULL, 5, stack_t2, 256, "RR_B");
+    assert(a != NULL && b != NULL);
+    rtos_start(1000, 1000);
+    assert(current_tcb == a);
+
+    // Yielding at equal priority must rotate to RR_B, then back to RR_A
+    rtos_yield();
+    assert(current_tcb == b);
+    rtos_yield();
+    assert(current_tcb == a);
+
+    // Deleting RR_B frees its slot for reuse
+    uint32_t old_id = b->id;
+    rtos_task_delete(b);
+    assert(b->state == TASK_STATE_UNUSED);
+    tcb_t *c = rtos_task_create_ex(dummy_task3, NULL, 5, stack_t3, 256, "RR_C");
+    assert(c != NULL && c->id == old_id);
+    printf("          Round-robin rotation & TCB slot reuse verified. [PASS]\n");
+}
+
+// -------------------------------------------------------------------------
+// Test 12: Software Timers (One-Shot & Periodic) + ISR Semaphore Signal
+// -------------------------------------------------------------------------
+static uint32_t g_tmr_oneshot_hits = 0;
+static uint32_t g_tmr_periodic_hits = 0;
+
+static void cb_oneshot(void *arg) {
+    (void)arg;
+    g_tmr_oneshot_hits++;
+}
+
+static void cb_periodic(void *arg) {
+    (void)arg;
+    g_tmr_periodic_hits++;
+}
+
+static void test_software_timers_and_isr_sem(void) {
+    printf("[TEST 12] Verifying software timers & rtos_sem_signal_from_isr()...\n");
+    rtos_init();
+    g_tmr_oneshot_hits = 0;
+    g_tmr_periodic_hits = 0;
+
+    rtos_task_create(dummy_task1, NULL, 5, stack_t1, 256, "TmrTask");
+    rtos_start(1000, 1000);
+
+    rtos_timer_t t1, t2;
+    rtos_timer_init(&t1, cb_oneshot, NULL);
+    rtos_timer_init(&t2, cb_periodic, NULL);
+    rtos_timer_start(&t1, 3, false);
+    rtos_timer_start(&t2, 2, true);
+
+    for (int i = 0; i < 6; i++) {
+        SysTick_Handler();
+    }
+    assert(g_tmr_oneshot_hits == 1);
+    assert(g_tmr_periodic_hits == 3);
+    rtos_timer_stop(&t2);
+    SysTick_Handler();
+    SysTick_Handler();
+    assert(g_tmr_periodic_hits == 3);
+
+    rtos_sem_t sem;
+    rtos_sem_init(&sem, 0, 2);
+    bool woken = false;
+    rtos_sem_signal_from_isr(&sem, &woken);
+    assert(sem.count == 1 && woken == false);
+    printf("          One-shot/periodic timers & ISR sem verified. [PASS]\n");
+}
+
 int main(void) {
     printf("====================================================\n");
     printf("      ZenRTOS Host Verification Test Suite         \n");
@@ -305,9 +412,12 @@ int main(void) {
     test_runtime_stats_and_cpu_load();
     test_trace_buffer_and_fault_capture();
     test_message_queue_ipc();
+    test_sem_and_mutex_timeouts();
+    test_round_robin_and_task_delete();
+    test_software_timers_and_isr_sem();
 
     printf("====================================================\n");
-    printf("  ALL 9 UNIT TESTS PASSED SUCCESSFULLY! (100%%)      \n");
+    printf("  ALL 12 UNIT TESTS PASSED SUCCESSFULLY! (100%%)     \n");
     printf("====================================================\n");
     return 0;
 }

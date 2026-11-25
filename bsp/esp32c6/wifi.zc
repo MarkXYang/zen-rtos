@@ -1,0 +1,150 @@
+// ZenRTOS ESP32-C6 Wi-Fi Shell & Zen-C API Module
+// Implements: wifi mac | wifi scan | wifi connect <ssid> [pass] | wifi status | wifi disconnect
+
+extern fn bsp_uart_puts(s: char*);
+extern fn bsp_uart_putc(c: char);
+extern fn bsp_uart_putdec(val: u32);
+
+extern fn wifi_drv_read_mac(mac_out: u8*);
+extern fn wifi_drv_init() -> i32;
+extern fn wifi_drv_scan(out_count: u16*) -> i32;
+extern fn wifi_drv_connect(ssid: char*, pass: char*) -> i32;
+extern fn wifi_drv_disconnect() -> i32;
+extern fn wifi_drv_get_state() -> i32;
+extern fn wifi_drv_get_ssid() -> char*;
+extern fn wifi_drv_free_heap() -> u32;
+
+fn wifi_put_hex_byte(b: u8) {
+    let hex: char* = "0123456789ABCDEF";
+    bsp_uart_putc(hex[(b >> 4) & 0xF]);
+    bsp_uart_putc(hex[b & 0xF]);
+}
+
+fn wifi_starts_with(s: char*, prefix: char*) -> bool {
+    let i: u32 = 0;
+    while prefix[i] != '\0' {
+        if s[i] == '\0' {
+            return false;
+        }
+        let a: char = s[i];
+        let b: char = prefix[i];
+        if a >= 'A' && a <= 'Z' {
+            a = (char)((u32)a + 32);
+        }
+        if b >= 'A' && b <= 'Z' {
+            b = (char)((u32)b + 32);
+        }
+        if a != b {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn wifi_print_mac() {
+    let mac: u8[6];
+    wifi_drv_read_mac(&mac[0]);
+    bsp_uart_puts("ESP32-C6 STA MAC   : ");
+    let i: u32 = 0;
+    while i < 6 {
+        wifi_put_hex_byte(mac[i]);
+        if i < 5 {
+            bsp_uart_putc(':');
+        }
+        i = i + 1;
+    }
+    bsp_uart_puts("\n");
+}
+
+fn wifi_print_status() {
+    let st: i32 = wifi_drv_get_state();
+    bsp_uart_puts("Wi-Fi STA State    : ");
+    if st == 0 {
+        bsp_uart_puts("UNINIT\n");
+    } else if st == 1 {
+        bsp_uart_puts("IDLE\n");
+    } else if st == 2 {
+        bsp_uart_puts("SCANNING\n");
+    } else if st == 3 {
+        bsp_uart_puts("CONNECTING\n");
+    } else if st == 4 {
+        bsp_uart_puts("CONNECTED\n");
+    } else {
+        bsp_uart_puts("UNKNOWN\n");
+    }
+    wifi_print_mac();
+    let ssid: char* = wifi_drv_get_ssid();
+    if ssid[0] != '\0' {
+        bsp_uart_puts("Target SSID        : ");
+        bsp_uart_puts(ssid);
+        bsp_uart_puts("\n");
+    }
+    bsp_uart_puts("Wi-Fi Heap Free    : ");
+    bsp_uart_putdec(wifi_drv_free_heap());
+    bsp_uart_puts(" B\n");
+}
+
+// Exported hook called by bsp/esp32c6/esp32c6.zc zensh> shell
+@used
+fn bsp_wifi_shell_cmd(cmd: char*) -> bool {
+    if !wifi_starts_with(cmd, "wifi") {
+        return false;
+    }
+    if cmd[4] != '\0' && cmd[4] != ' ' {
+        return false;
+    }
+
+    if wifi_starts_with(cmd, "wifi mac") {
+        wifi_print_mac();
+    } else if wifi_starts_with(cmd, "wifi status") || cmd[4] == '\0' {
+        wifi_print_status();
+    } else if wifi_starts_with(cmd, "wifi scan") {
+        bsp_uart_puts("Starting 2.4 GHz Wi-Fi AP scan...\n");
+        let ap_num: u16 = 0;
+        let err: i32 = wifi_drv_scan(&ap_num);
+        if err != 0 {
+            bsp_uart_puts("Wi-Fi scan error: ");
+            bsp_uart_putdec((u32)err);
+            bsp_uart_puts("\n");
+        } else {
+            bsp_uart_puts("Scan complete. Access points found: ");
+            bsp_uart_putdec((u32)ap_num);
+            bsp_uart_puts("\n");
+        }
+    } else if wifi_starts_with(cmd, "wifi connect ") {
+        let arg: char* = &cmd[13];
+        let ssid_buf: char[33];
+        let pass_buf: char[65];
+        let si: u32 = 0;
+        while arg[si] != '\0' && arg[si] != ' ' && si < 32 {
+            ssid_buf[si] = arg[si];
+            si = si + 1;
+        }
+        ssid_buf[si] = '\0';
+        let pi: u32 = 0;
+        if arg[si] == ' ' {
+            let p: char* = &arg[si + 1];
+            while p[pi] != '\0' && pi < 64 {
+                pass_buf[pi] = p[pi];
+                pi = pi + 1;
+            }
+        }
+        pass_buf[pi] = '\0';
+        bsp_uart_puts("Connecting to SSID '");
+        bsp_uart_puts(&ssid_buf[0]);
+        bsp_uart_puts("'...\n");
+        let err: i32 = wifi_drv_connect(&ssid_buf[0], &pass_buf[0]);
+        if err != 0 {
+            bsp_uart_puts("Wi-Fi connect error: ");
+            bsp_uart_putdec((u32)err);
+            bsp_uart_puts("\n");
+        }
+    } else if wifi_starts_with(cmd, "wifi disconnect") {
+        let _err: i32 = wifi_drv_disconnect();
+        bsp_uart_puts("Wi-Fi disconnected.\n");
+    } else {
+        bsp_uart_puts("Usage: wifi [mac | scan | connect <ssid> [pass] | status | disconnect]\n");
+    }
+    return true;
+}

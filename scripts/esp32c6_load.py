@@ -174,6 +174,7 @@ def main():
         raw_image += b"\x00" * (4 - (len(raw_image) % 4))
 
     ram_only = "--ram" in sys.argv
+    raw_flash = "--raw-flash" in sys.argv
 
     print(f"[esp32c6] Connecting to {PORT}...")
     ser = serial.Serial(PORT, 115200, timeout=0.05)
@@ -212,10 +213,11 @@ def main():
         mem_end = struct.pack("<II", 0, ENTRY_ADDR)
         send_cmd(ser, ESP_MEM_END, mem_end, 0, timeout=0.3)
     else:
-        flash_image = build_esp32c6_flash_image(raw_image)
+        flash_image = raw_image if raw_flash else build_esp32c6_flash_image(raw_image)
         num_blocks = (len(flash_image) + BLOCK_SIZE - 1) // BLOCK_SIZE
+        mode_str = "Direct-Boot XIP (raw)" if raw_flash else "0xE9 SRAM image"
 
-        print("[esp32c6] Attaching 4MB SPI Flash...")
+        print(f"[esp32c6] Attaching 4MB SPI Flash ({mode_str})...")
         if not send_cmd(ser, ESP_SPI_ATTACH, struct.pack("<II", 0, 0), 0, timeout=1.0):
             print("[esp32c6] ERROR: SPI_ATTACH failed")
             sys.exit(1)

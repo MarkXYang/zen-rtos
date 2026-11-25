@@ -404,6 +404,18 @@ fn bsp_shell_banner() {
     bsp_shell_prompt();
 }
 
+// Optional Wi-Fi shell hook (implemented in bsp/esp32c6/wifi.zc when built with make esp32c6-wifi)
+fn bsp_try_wifi_cmd(_cmd: char*) -> bool {
+    let handled: bool = false;
+    raw {
+        extern bool bsp_wifi_shell_cmd(char *cmd) __attribute__((weak));
+        if (bsp_wifi_shell_cmd) {
+            handled = bsp_wifi_shell_cmd(_cmd);
+        }
+    }
+    return handled;
+}
+
 fn bsp_shell_exec(raw_cmd: char*, sensor_q: rtos::rtos_queue_t*,
                   latest_temp: u32, led_auto_blink: u32*,
                   telemetry_log_on: u32*) {
@@ -430,6 +442,7 @@ fn bsp_shell_exec(raw_cmd: char*, sensor_q: rtos::rtos_queue_t*,
         bsp_uart_puts("  log on|off      - Enable/disable periodic telemetry console stream\n");
         bsp_uart_puts("  fault           - Show RISC-V post-mortem exception CSR record\n");
         bsp_uart_puts("  uptime          - Show system tick counter and uptime\n");
+        bsp_uart_puts("  wifi <subcmd>   - Wi-Fi control (mac|scan|connect|status|disconnect)\n");
         bsp_uart_puts("  clear           - Clear terminal screen\n");
     } else if bsp_streq(cmd, "ps") || bsp_streq(cmd, "top") {
         bsp_debug_dump_status_table(latest_temp);
@@ -558,6 +571,8 @@ fn bsp_shell_exec(raw_cmd: char*, sensor_q: rtos::rtos_queue_t*,
         bsp_uart_puts(" ticks)\n");
     } else if bsp_streq(cmd, "clear") || bsp_streq(cmd, "cls") {
         bsp_uart_puts("\x1b[2J\x1b[H");
+    } else if bsp_try_wifi_cmd(cmd) {
+        // Handled by ESP32-C6 Wi-Fi module (bsp/esp32c6/wifi.zc)
     } else {
         bsp_uart_puts("Unknown command: '");
         bsp_uart_puts(cmd);

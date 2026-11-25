@@ -4,18 +4,31 @@
 _mtvec_table:
     j riscv_exception_handler     /* Vectored Slot 0: Synchronous Exceptions */
     .rept 2
-    j Default_IRQ_Handler         /* Slots 1..2 */
+    j riscv_ext_irq_handler       /* Slots 1..2: External / PLIC_MX IRQs */
     .endr
     j riscv_msip_handler          /* Slot 3: CLINT Machine Software Interrupt (PendSV equivalent) */
     .rept 3
-    j Default_IRQ_Handler         /* Slots 4..6 */
+    j riscv_ext_irq_handler       /* Slots 4..6: External / PLIC_MX IRQs */
     .endr
     j riscv_mtimer_handler        /* Slot 7: CLINT Machine Timer Interrupt (SysTick equivalent) */
     .rept 24
-    j Default_IRQ_Handler         /* Slots 8..31: External / Peripheral IRQs */
+    j riscv_ext_irq_handler       /* Slots 8..31: External / PLIC_MX Peripheral IRQs (Wi-Fi MAC=9, PWR=10) */
     .endr
 
-.section .text
+.section .bss
+.balign 16
+.global g_isr_stack
+g_isr_stack:
+    .space 4096
+.global _isr_stack_top
+_isr_stack_top:
+
+.balign 4
+.global g_isr_nest_depth
+g_isr_nest_depth:
+    .word 0
+
+.section .iram1, "ax"
 .global rtos_start_first_task
 .type rtos_start_first_task, @function
 
@@ -31,7 +44,7 @@ rtos_start_first_task:
     addi  sp, sp, 128             /* Release 32-word initial stack frame */
     mret                          /* Atomically sets MIE=MPIE and jumps to mepc! */
 
-/* Macro to save all registers onto current task stack */
+/* Macro to save all registers onto current stack */
 .macro SAVE_CONTEXT
     addi  sp, sp, -128
     sw    ra,  8(sp)
@@ -68,7 +81,7 @@ rtos_start_first_task:
     sw    t0,  4(sp)
 .endm
 
-/* Macro to restore all registers from current task stack */
+/* Macro to restore all registers from current stack */
 .macro RESTORE_CONTEXT
     lw    t0,  0(sp)
     csrw  mepc, t0
@@ -105,6 +118,47 @@ rtos_start_first_task:
     addi  sp, sp, 128
 .endm
 
+/* Switch to dedicated 4 KB ISR stack on outermost interrupt (g_isr_nest_depth == 0) */
+.macro ENTER_ISR_STACK
+    la    t0, g_isr_nest_depth
+    lw    t1, 0(t0)
+    addi  t2, t1, 1
+    sw    t2, 0(t0)
+    bnez  t1, 99f
+    la    t0, current_tcb
+    lw    t1, 0(t0)
+    beqz  t1, 98f
+    sw    sp, 0(t1)
+98:
+    la    sp, _isr_stack_top
+99:
+.endm
+
+/* Return from ISR stack and perform pending task switch if outermost interrupt */
+.macro EXIT_ISR_STACK
+    la    t0, g_isr_nest_depth
+    lw    t1, 0(t0)
+    addi  t1, t1, -1
+    sw    t1, 0(t0)
+    bnez  t1, 97f
+
+    la    t0, current_tcb
+    lw    t1, 0(t0)
+    la    t2, next_tcb
+    lw    t3, 0(t2)
+    beqz  t3, 96f
+    sw    zero, 0(t2)
+    sw    t3, 0(t0)
+    mv    t1, t3
+    /* Clear pending MSIP (0x20001800) since we already switched here */
+    li    t4, 0x20001800
+    sw    zero, 0(t4)
+96:
+    beqz  t1, 97f
+    lw    sp, 0(t1)
+97:
+.endm
+
 /* Slot 3: CLINT Machine Software Interrupt (Context Switcher) */
 .global riscv_msip_handler
 riscv_msip_handler:
@@ -137,36 +191,36 @@ riscv_msip_handler:
 .global riscv_mtimer_handler
 riscv_mtimer_handler:
     SAVE_CONTEXT
+    ENTER_ISR_STACK
 
-    /* Save outgoing sp to current_tcb->sp in case SysTick_Handler switches tasks */
-    la    t0, current_tcb
-    lw    t1, 0(t0)
-    sw    sp, 0(t1)
-
-    /* Advance MTIMECMP and run C SysTick_Handler() */
     call  bsp_ack_mtimer
     call  SysTick_Handler
 
-    /* If next_tcb was updated by rtos_schedule(), switch to it immediately */
-    la    t0, current_tcb
-    lw    t1, 0(t0)
-    la    t2, next_tcb
-    lw    t3, 0(t2)
-    beqz  t3, 1f
-    sw    zero, 0(t2)
-    sw    t3, 0(t0)
-    mv    t1, t3
-    /* Also clear pending MSIP (0x20001800) since we already switched here */
-    li    t4, 0x20001800
-    sw    zero, 0(t4)
-1:
-    lw    sp, 0(t1)
+    EXIT_ISR_STACK
     RESTORE_CONTEXT
     mret
+
+/* Slots 1..2, 4..6, 8..31: External / PLIC_MX Peripheral Interrupts */
+.global riscv_ext_irq_handler
+riscv_ext_irq_handler:
+    SAVE_CONTEXT
+    ENTER_ISR_STACK
+
+    csrr  a0, mcause
+    andi  a0, a0, 0x1F
+    call  bsp_riscv_ext_irq_dispatch
+
+    EXIT_ISR_STACK
+    RESTORE_CONTEXT
+    mret
+
+.weak bsp_riscv_ext_irq_dispatch
+.type bsp_riscv_ext_irq_dispatch, %function
+bsp_riscv_ext_irq_dispatch:
+    ret
 
 riscv_exception_handler:
     mv    a0, sp
     call  rtos_fault_capture
 Default_IRQ_Handler:
     j     Default_IRQ_Handler
-

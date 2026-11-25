@@ -12,3 +12,4 @@ app/main_zc.c
 *~
 .vscode/
 .idea/
+third_party/esp32c6_wifi/
