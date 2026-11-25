@@ -1,9 +1,10 @@
 // ZenRTOS Application in Zen-C
-// Targets: STM32L476RG (ARM Cortex-M4) & ESP32-C6-Pico (RISC-V RV32IMAC)
+// Targets: STM32L476RG (ARM Cortex-M4), ESP32-C6-Pico (RISC-V RV32IMAC) & NXP i.MX RT1021 (ARM Cortex-M7)
 
 import "rtos.h" as rtos;
 
 // Board Support Package (BSP) interface implemented in bsp/<board>/<board>.zc
+extern fn bsp_get_cpu_freq_hz() -> u32;
 extern fn bsp_init_led();
 extern fn bsp_toggle_led();
 extern fn bsp_debug_dump_status(shared_temp: u32);
@@ -80,7 +81,8 @@ fn task_shell(_arg: void*) {
 }
 
 fn main() -> int {
-    bsp_init_uart(4000000, 115200);
+    let cpu_hz: u32 = bsp_get_cpu_freq_hz();
+    bsp_init_uart(cpu_hz, 115200);
     bsp_uart_puts("\n[ZenRTOS] Booting Zen-C RTOS Application...\n");
 
     rtos::rtos_init();
@@ -94,7 +96,7 @@ fn main() -> int {
     rtos::rtos_task_create(task_led_blink, NULL, 10, &stack_led[0], STACK_SIZE_WORDS, "BlinkLED");
 
     // Start RTOS scheduler (1000 Hz tick = 1 ms)
-    rtos::rtos_start(4000000, 1000);
+    rtos::rtos_start(cpu_hz, 1000);
 
     return 0;
 }

@@ -1,0 +1,661 @@
+// ZenRTOS Board Support Package (BSP) in Zen-C
+// Target: NXP i.MX RT1021 (MIMXRT1020-EVK, ARM Cortex-M7 @ 24 MHz XTAL)
+
+import "rtos.h" as rtos;
+
+// 1. ARM Cortex-M7 SCB & NVIC Registers
+def SCB_AIRCR_ADDR: u32                = 0xE000ED0C;
+def NVIC_ISER0_ADDR: u32               = 0xE000E100; // IRQs 0..31 (LPUART1 = IRQ 20 -> bit 20)
+
+// 2. Watchdog Registers (Must be disabled early in Reset_Handler)
+def WDOG1_WCR_ADDR: u32                = 0x400B8000;
+def WDOG2_WCR_ADDR: u32                = 0x400D0000;
+def RTWDOG_CS_ADDR: u32                = 0x400BC000;
+def RTWDOG_CNT_ADDR: u32               = 0x400BC004;
+def RTWDOG_TOVAL_ADDR: u32             = 0x400BC008;
+
+// 3. Clock Control Module (CCM, Base 0x400FC000)
+def CCM_CBCDR_ADDR: u32                = 0x400FC014;
+def CCM_CBCMR_ADDR: u32                = 0x400FC018;
+def CCM_CSCDR1_ADDR: u32               = 0x400FC024;
+def CCM_CDHIPR_ADDR: u32               = 0x400FC048;
+def CCM_CCGR1_ADDR: u32                = 0x400FC06C; // CG13 (bits 27:26) = GPIO1
+def CCM_CCGR4_ADDR: u32                = 0x400FC078; // CG1  (bits 3:2)   = IOMUXC
+def CCM_CCGR5_ADDR: u32                = 0x400FC07C; // CG12 (bits 25:24) = LPUART1
+
+// 4. IOMUXC Registers (MIMXRT1021 93-pad table, Base 0x401F8000)
+//    GPIO_AD_B0_05 -> ALT5 = GPIO1_IO05 (User LED on MIMXRT1020-EVK)
+//    GPIO_AD_B0_06 -> ALT2 = LPUART1_TX (OpenSDA / CMSIS-DAP VCP)
+//    GPIO_AD_B0_07 -> ALT2 = LPUART1_RX (OpenSDA / CMSIS-DAP VCP)
+def IOMUXC_MUX_AD_B0_05_ADDR: u32      = 0x401F80D0;
+def IOMUXC_MUX_AD_B0_06_ADDR: u32      = 0x401F80D4;
+def IOMUXC_MUX_AD_B0_07_ADDR: u32      = 0x401F80D8;
+def IOMUXC_PAD_AD_B0_05_ADDR: u32      = 0x401F8244;
+def IOMUXC_PAD_AD_B0_06_ADDR: u32      = 0x401F8248;
+def IOMUXC_PAD_AD_B0_07_ADDR: u32      = 0x401F824C;
+
+// 5. GPIO1 Registers (Base 0x401B8000: Pin 5 = User LED)
+def GPIO1_DR_ADDR: u32                 = 0x401B8000;
+def GPIO1_GDIR_ADDR: u32               = 0x401B8004;
+def GPIO1_DR_SET_ADDR: u32             = 0x401B8084;
+def GPIO1_DR_CLEAR_ADDR: u32           = 0x401B8088;
+def GPIO1_DR_TOGGLE_ADDR: u32          = 0x401B808C;
+def LED_GPIO_PIN: u32                  = 5;
+
+// 6. LPUART1 Registers (Base 0x40184000, IRQ 20)
+def LPUART1_GLOBAL_ADDR: u32           = 0x40184008;
+def LPUART1_BAUD_ADDR: u32             = 0x40184010;
+def LPUART1_STAT_ADDR: u32             = 0x40184014;
+def LPUART1_CTRL_ADDR: u32             = 0x40184018;
+def LPUART1_DATA_ADDR: u32             = 0x4018401C;
+def LPUART1_IRQ_NUM: u32               = 20;
+
+// Deterministic 24 MHz XTAL clock (used for both Core & LPUART1 root clock)
+def RT1021_OSC_FREQ_HZ: u32            = 24000000;
+
+// Interrupt-driven 128-byte UART RX Ring Buffer & Shell State
+def UART_RX_BUF_SIZE: u32              = 128;
+let g_uart_rx_buf: char[128];
+let g_uart_rx_head: u32 = 0;
+let g_uart_rx_tail: u32 = 0;
+let g_shell_cmd_buf: char[64];
+let g_shell_cmd_len: u32 = 0;
+let g_shell_esc_state: u32 = 0;
+let g_shell_last_eol: char = 0;
+
+// Volatile 32-bit & 16-bit MMIO Register Helpers
+@inline
+fn mmio_read32(_addr: u32) -> u32 {
+    let val: u32 = 0;
+    raw { val = *(volatile uint32_t *)(uintptr_t)_addr; }
+    return val;
+}
+
+@inline
+fn mmio_write32(_addr: u32, _val: u32) {
+    raw { *(volatile uint32_t *)(uintptr_t)_addr = _val; }
+}
+
+@inline
+fn mmio_read16(_addr: u32) -> u16 {
+    let val: u16 = 0;
+    raw { val = *(volatile uint16_t *)(uintptr_t)_addr; }
+    return val;
+}
+
+@inline
+fn mmio_write16(_addr: u32, _val: u16) {
+    raw { *(volatile uint16_t *)(uintptr_t)_addr = _val; }
+}
+
+// Exported for app/main.zc
+fn bsp_get_cpu_freq_hz() -> u32 {
+    return RT1021_OSC_FREQ_HZ;
+}
+
+// Exported for bsp/rt1021/startup.s (called in Reset_Handler before .data/.bss init)
+@used
+fn bsp_early_init() {
+    // 1. Disable RTWDOG (WDOG3 @ 0x400BC000)
+    let rtw_cs: u32 = mmio_read32(RTWDOG_CS_ADDR);
+    if (rtw_cs & (1 << 7)) != 0 {
+        if (rtw_cs & (1 << 13)) != 0 {
+            // 32-bit unlock command enabled (CMD32EN = 1)
+            mmio_write32(RTWDOG_CNT_ADDR, (u32)0xD928C520);
+        } else {
+            // 16-bit unlock sequence
+            mmio_write16(RTWDOG_CNT_ADDR, (u16)0xC520);
+            mmio_write16(RTWDOG_CNT_ADDR, (u16)0xD928);
+        }
+        mmio_write32(RTWDOG_TOVAL_ADDR, 0xFFFF);
+        // Clear EN (bit 7), set UPDATE (bit 5) so future reconfig is permitted
+        mmio_write32(RTWDOG_CS_ADDR, (rtw_cs & ~(1 << 7)) | (1 << 5));
+    }
+
+    // 2. Disable WDOG1 and WDOG2 if enabled (clear WDE bit 2 via 16-bit access)
+    let w1: u16 = mmio_read16(WDOG1_WCR_ADDR);
+    if (w1 & (1 << 2)) != 0 {
+        mmio_write16(WDOG1_WCR_ADDR, (u16)(w1 & ~(1 << 2)));
+    }
+    let w2: u16 = mmio_read16(WDOG2_WCR_ADDR);
+    if (w2 & (1 << 2)) != 0 {
+        mmio_write16(WDOG2_WCR_ADDR, (u16)(w2 & ~(1 << 2)));
+    }
+
+    // 3. Select deterministic 24 MHz XTAL (osc_clk) for periph_clk / AHB / IPG
+    //    so both RAM-loaded and FlexSPI XIP boots run at an exact known 24 MHz.
+    let cbcmr: u32 = mmio_read32(CCM_CBCMR_ADDR);
+    cbcmr = (cbcmr & ~(3 << 12)) | (1 << 12); // PERIPH_CLK2_SEL = 01 (osc_clk 24 MHz)
+    mmio_write32(CCM_CBCMR_ADDR, cbcmr);
+
+    let cbcdr: u32 = mmio_read32(CCM_CBCDR_ADDR);
+    cbcdr = cbcdr | (1 << 25);                // PERIPH_CLK_SEL = 1 (periph_clk2)
+    cbcdr = cbcdr & ~(7 << 27);               // PERIPH_CLK2_PODF = 0 (/1)
+    cbcdr = cbcdr & ~(7 << 10);               // AHB_PODF = 0 (/1 -> 24 MHz)
+    cbcdr = cbcdr & ~(3 << 8);                // IPG_PODF = 0 (/1 -> 24 MHz)
+    mmio_write32(CCM_CBCDR_ADDR, cbcdr);
+    while (mmio_read32(CCM_CDHIPR_ADDR) & ((1 << 5) | (1 << 1))) != 0 {}
+
+    // 4. Route LPUART clock root from 24 MHz osc_clk (UART_CLK_SEL = 1, PODF = 0)
+    let cscdr1: u32 = mmio_read32(CCM_CSCDR1_ADDR);
+    cscdr1 = (cscdr1 & ~0x7F) | (1 << 6);
+    mmio_write32(CCM_CSCDR1_ADDR, cscdr1);
+
+    // 5. Ungate IOMUXC (CCGR4 CG1), GPIO1 (CCGR1 CG13), and LPUART1 (CCGR5 CG12)
+    mmio_write32(CCM_CCGR4_ADDR, mmio_read32(CCM_CCGR4_ADDR) | (3 << 2));
+    mmio_write32(CCM_CCGR1_ADDR, mmio_read32(CCM_CCGR1_ADDR) | (3 << 26));
+    mmio_write32(CCM_CCGR5_ADDR, mmio_read32(CCM_CCGR5_ADDR) | (3 << 24));
+}
+
+fn bsp_init_led() {
+    // Mux GPIO_AD_B0_05 -> ALT5 (GPIO1_IO05) with standard drive strength
+    mmio_write32(IOMUXC_MUX_AD_B0_05_ADDR, 0x5);
+    mmio_write32(IOMUXC_PAD_AD_B0_05_ADDR, 0x10B0);
+
+    // Configure GPIO1 pin 5 as output
+    let gdir: u32 = mmio_read32(GPIO1_GDIR_ADDR);
+    mmio_write32(GPIO1_GDIR_ADDR, gdir | (1 << LED_GPIO_PIN));
+}
+
+fn bsp_toggle_led() {
+    mmio_write32(GPIO1_DR_TOGGLE_ADDR, (1 << LED_GPIO_PIN));
+}
+
+fn bsp_set_led(on: bool) {
+    if on {
+        mmio_write32(GPIO1_DR_SET_ADDR, (1 << LED_GPIO_PIN));
+    } else {
+        mmio_write32(GPIO1_DR_CLEAR_ADDR, (1 << LED_GPIO_PIN));
+    }
+}
+
+fn bsp_get_led() -> bool {
+    return (mmio_read32(GPIO1_DR_ADDR) & (1 << LED_GPIO_PIN)) != 0;
+}
+
+// Exported for bsp/rt1021/startup.s vector table (IRQ 20 / Vector Slot 36)
+@used
+fn LPUART1_IRQHandler() {
+    let stat: u32 = mmio_read32(LPUART1_STAT_ADDR);
+    // Clear RX Overrun (OR = bit 19), Noise (NF = bit 18), Framing (FE = bit 17) flags (W1C)
+    if (stat & ((1 << 19) | (1 << 18) | (1 << 17))) != 0 {
+        mmio_write32(LPUART1_STAT_ADDR, (1 << 19) | (1 << 18) | (1 << 17));
+    }
+    // Drain received bytes while RDRF (bit 21) is set
+    while (mmio_read32(LPUART1_STAT_ADDR) & (1 << 21)) != 0 {
+        let c: char = (char)(mmio_read32(LPUART1_DATA_ADDR) & 0xFF);
+        let next: u32 = (g_uart_rx_head + 1) % UART_RX_BUF_SIZE;
+        if next != g_uart_rx_tail {
+            g_uart_rx_buf[g_uart_rx_head] = c;
+            g_uart_rx_head = next;
+        }
+    }
+    raw { __asm volatile ("dsb" : : : "memory"); }
+}
+
+// Initialize LPUART1 on GPIO_AD_B0_06 (TX) and GPIO_AD_B0_07 (RX) -> OpenSDA VCP
+fn bsp_init_uart(_cpu_freq_hz: u32, baud: u32) {
+    // 1. Mux GPIO_AD_B0_06 (LPUART1_TX) and GPIO_AD_B0_07 (LPUART1_RX) to ALT2
+    mmio_write32(IOMUXC_MUX_AD_B0_06_ADDR, 0x2);
+    mmio_write32(IOMUXC_PAD_AD_B0_06_ADDR, 0x10B0);
+    mmio_write32(IOMUXC_MUX_AD_B0_07_ADDR, 0x2);
+    mmio_write32(IOMUXC_PAD_AD_B0_07_ADDR, 0x10B0);
+
+    // 2. Software reset LPUART1
+    mmio_write32(LPUART1_GLOBAL_ADDR, (1 << 1));
+    mmio_write32(LPUART1_GLOBAL_ADDR, 0);
+
+    // 3. Configure baud rate from 24 MHz uart_clk_root with OSR=15 (16x oversampling)
+    //    For 115200 bps: SBR = (24000000 + 921600) / 1843200 = 13 -> 115384.6 bps (0.16% err)
+    let sbr: u32 = (RT1021_OSC_FREQ_HZ + (baud * 8)) / (baud * 16);
+    if sbr == 0 {
+        sbr = 1;
+    }
+    mmio_write32(LPUART1_BAUD_ADDR, (15 << 24) | (sbr & 0x1FFF));
+
+    // 4. Enable Receiver Interrupt (RIE = bit 21), Transmitter (TE = bit 19), Receiver (RE = bit 18)
+    mmio_write32(LPUART1_CTRL_ADDR, (1 << 21) | (1 << 19) | (1 << 18));
+
+    // 5. Enable LPUART1_IRQn (IRQ 20 -> bit 20 in NVIC_ISER0)
+    mmio_write32(NVIC_ISER0_ADDR, (1 << LPUART1_IRQ_NUM));
+}
+
+fn bsp_uart_putc(c: char) {
+    // Wait until TDRE (Transmit Data Register Empty, bit 23 of STAT) is set
+    while (mmio_read32(LPUART1_STAT_ADDR) & (1 << 23)) == 0 {}
+    mmio_write32(LPUART1_DATA_ADDR, (u32)(u8)c);
+}
+
+// Non-blocking UART RX read from interrupt-driven ring buffer
+fn bsp_uart_getc(out_c: char*) -> bool {
+    if g_uart_rx_head != g_uart_rx_tail {
+        *out_c = g_uart_rx_buf[g_uart_rx_tail];
+        g_uart_rx_tail = (g_uart_rx_tail + 1) % UART_RX_BUF_SIZE;
+        return true;
+    }
+    return false;
+}
+
+fn bsp_uart_puts(s: char*) {
+    if s == NULL {
+        return;
+    }
+    let idx: u32 = 0;
+    while s[idx] != '\0' {
+        if s[idx] == '\n' {
+            bsp_uart_putc('\r');
+        }
+        bsp_uart_putc(s[idx]);
+        idx = idx + 1;
+    }
+}
+
+fn bsp_uart_putdec(val: u32) {
+    let buf: char[12];
+    let i: i32 = 0;
+    let v: u32 = val;
+    if v == 0 {
+        bsp_uart_putc('0');
+        return;
+    }
+    while v > 0 && i < 11 {
+        buf[i] = (char)((u32)'0' + (v % 10));
+        v = v / 10;
+        i = i + 1;
+    }
+    while i > 0 {
+        i = i - 1;
+        bsp_uart_putc(buf[i]);
+    }
+}
+
+fn bsp_uart_puthex(val: u32) {
+    let hex: char* = "0123456789ABCDEF";
+    bsp_uart_puts("0x");
+    let shift: i32 = 28;
+    while shift >= 0 {
+        let nibble: u32 = (val >> (u32)shift) & 0xF;
+        bsp_uart_putc(hex[nibble]);
+        shift = shift - 4;
+    }
+}
+
+fn bsp_task_state_str(st: rtos::task_state_t) -> char* {
+    if st == rtos::TASK_STATE_READY {
+        return "READY  ";
+    } else if st == rtos::TASK_STATE_BLOCKED {
+        return "BLOCKED";
+    } else if st == rtos::TASK_STATE_SUSPENDED {
+        return "SUSPEND";
+    }
+    return "UNKNOWN";
+}
+
+fn bsp_trace_type_str(t_type: u8) -> char* {
+    let tr: rtos::rtos_trace_type_t = (rtos::rtos_trace_type_t)t_type;
+    if tr == rtos::TRACE_TASK_CREATE {
+        return "TASK_CREATE ";
+    } else if tr == rtos::TRACE_TASK_SWITCH {
+        return "TASK_SWITCH ";
+    } else if tr == rtos::TRACE_TASK_DELAY {
+        return "TASK_DELAY  ";
+    } else if tr == rtos::TRACE_TASK_WAKE {
+        return "TASK_WAKE   ";
+    } else if tr == rtos::TRACE_SEM_WAIT {
+        return "SEM_WAIT    ";
+    } else if tr == rtos::TRACE_SEM_SIGNAL {
+        return "SEM_SIGNAL  ";
+    } else if tr == rtos::TRACE_MUTEX_LOCK {
+        return "MUTEX_LOCK  ";
+    } else if tr == rtos::TRACE_MUTEX_UNLOCK {
+        return "MUTEX_UNLOCK";
+    } else if tr == rtos::TRACE_MUTEX_PI_BOOST {
+        return "MUTEX_PI_BST";
+    } else if tr == rtos::TRACE_STACK_OVERFLOW {
+        return "STACK_OVFLW ";
+    } else if tr == rtos::TRACE_FAULT {
+        return "HARD_FAULT  ";
+    } else if tr == rtos::TRACE_ASSERT_FAIL {
+        return "ASSERT_FAIL ";
+    } else if tr == rtos::TRACE_QUEUE_SEND {
+        return "QUEUE_SEND  ";
+    } else if tr == rtos::TRACE_QUEUE_RECV {
+        return "QUEUE_RECV  ";
+    }
+    return "NONE        ";
+}
+
+fn bsp_debug_dump_status_table(shared_temp: u32) {
+    let stats: rtos::rtos_stats_t;
+    rtos::rtos_get_stats(&stats);
+
+    bsp_uart_puts("\n=== [ZenRTOS Debug Telemetry] Tick: ");
+    bsp_uart_putdec(stats.uptime_ticks);
+    bsp_uart_puts(" ms | CPU Load: ");
+    bsp_uart_putdec(stats.cpu_load_percent);
+    bsp_uart_puts("% | CtxSw: ");
+    bsp_uart_putdec(stats.total_ctx_switches);
+    bsp_uart_puts(" | Temp: ");
+    bsp_uart_putdec(shared_temp);
+    bsp_uart_puts("C ===\n");
+    bsp_uart_puts("  ID  Name        State    Prio  RunTicks  CtxSw  StackFree\n");
+    bsp_uart_puts("  --  ----------  -------  ----  --------  -----  ---------\n");
+
+    let id: u32 = 1;
+    while id <= stats.task_count {
+        let t: rtos::tcb_t* = (rtos::tcb_t*)rtos::rtos_get_task_by_id(id);
+        if t != NULL {
+            let free_words: u32 = rtos::rtos_task_stack_free_words(id);
+            bsp_uart_puts("  #");
+            bsp_uart_putdec(t.id);
+            bsp_uart_puts("  ");
+            bsp_uart_puts((char*)t.name);
+            let len: u32 = 0;
+            let p: char* = (char*)t.name;
+            while p[len] != '\0' {
+                len = len + 1;
+            }
+            while len < 12 {
+                bsp_uart_putc(' ');
+                len = len + 1;
+            }
+
+            bsp_uart_puts(bsp_task_state_str(t.state));
+            bsp_uart_puts("  ");
+            bsp_uart_putdec(t.current_priority);
+            if t.current_priority < 10 {
+                bsp_uart_putc(' ');
+            }
+            bsp_uart_puts("    ");
+            bsp_uart_putdec(t.run_ticks);
+            bsp_uart_puts("\t   ");
+            bsp_uart_putdec(t.ctx_switches);
+            bsp_uart_puts("\t  ");
+            bsp_uart_putdec(free_words * 4);
+            bsp_uart_puts("/");
+            bsp_uart_putdec(t.stack_size * 4);
+            bsp_uart_puts("B\n");
+        }
+        id = id + 1;
+    }
+}
+
+fn bsp_debug_dump_status(shared_temp: u32) {
+    if g_shell_cmd_len > 0 {
+        return;
+    }
+    bsp_debug_dump_status_table(shared_temp);
+    bsp_uart_puts("zensh> ");
+}
+
+fn bsp_tolower(c: char) -> char {
+    if c >= 'A' && c <= 'Z' {
+        return (char)((u32)c + ((u32)'a' - (u32)'A'));
+    }
+    return c;
+}
+
+fn bsp_streq(a: char*, b: char*) -> bool {
+    let i: u32 = 0;
+    while a[i] != '\0' && b[i] != '\0' {
+        if bsp_tolower(a[i]) != bsp_tolower(b[i]) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return a[i] == '\0' && b[i] == '\0';
+}
+
+fn bsp_shell_prompt() {
+    bsp_uart_puts("zensh> ");
+}
+
+fn bsp_shell_banner() {
+    bsp_uart_puts("\n========================================================\n");
+    bsp_uart_puts("  ZenRTOS Interactive Shell (zensh v1.2) - NXP RT1021   \n");
+    bsp_uart_puts("  Type 'help' for available RTOS inspection commands.   \n");
+    bsp_uart_puts("  Type 'log off' to stop periodic telemetry printout.   \n");
+    bsp_uart_puts("========================================================\n");
+    bsp_shell_prompt();
+}
+
+fn bsp_shell_exec(raw_cmd: char*, sensor_q: rtos::rtos_queue_t*,
+                  latest_temp: u32, led_auto_blink: u32*,
+                  telemetry_log_on: u32*) {
+    let start: u32 = 0;
+    while raw_cmd[start] == ' ' || raw_cmd[start] == '\t' {
+        start = start + 1;
+    }
+    let cmd: char* = &raw_cmd[start];
+    if cmd[0] == '\0' {
+        return;
+    }
+
+    if bsp_streq(cmd, "help") || bsp_streq(cmd, "?") {
+        bsp_uart_puts("Available ZenRTOS Shell Commands:\n");
+        bsp_uart_puts("  help            - Show this command reference\n");
+        bsp_uart_puts("  ps / top        - List all tasks, priorities, CPU load & stack watermarks\n");
+        bsp_uart_puts("  trace           - Dump recent kernel trace ring buffer events\n");
+        bsp_uart_puts("  sensor / temp   - Read latest sensor temperature & IPC queue count\n");
+        bsp_uart_puts("  mem / stack     - Check stack canary (0xDEADBEEF) & high-water marks\n");
+        bsp_uart_puts("  led on|off      - Turn GPIO1_IO05 user LED ON or OFF (manual override)\n");
+        bsp_uart_puts("  led toggle      - Toggle GPIO1_IO05 user LED state\n");
+        bsp_uart_puts("  led blink       - Resume automatic 1 Hz RTOS LED blinking task\n");
+        bsp_uart_puts("  log on|off      - Enable/disable periodic telemetry console stream\n");
+        bsp_uart_puts("  fault           - Show Cortex-M7 post-mortem HardFault register record\n");
+        bsp_uart_puts("  uptime          - Show system tick counter and uptime\n");
+        bsp_uart_puts("  clear           - Clear terminal screen\n");
+        bsp_uart_puts("  reboot          - Trigger Cortex-M7 software system reset\n");
+    } else if bsp_streq(cmd, "ps") || bsp_streq(cmd, "top") {
+        bsp_debug_dump_status_table(latest_temp);
+    } else if bsp_streq(cmd, "trace") {
+        let buf: const rtos::rtos_trace_event_t* = NULL;
+        let head: u32 = 0;
+        let count: u32 = rtos::rtos_trace_get_events(&buf, &head);
+        let show: u32 = count;
+        if show > 12 {
+            show = 12;
+        }
+        bsp_uart_puts("=== Recent Kernel Trace Events (showing last ");
+        bsp_uart_putdec(show);
+        bsp_uart_puts(" of ");
+        bsp_uart_putdec(count);
+        bsp_uart_puts(") ===\n");
+        let i: u32 = 0;
+        while i < show {
+            let idx: u32 = (head + 64 - show + i) % 64;
+            bsp_uart_puts("  [");
+            bsp_uart_putdec(buf[idx].tick);
+            bsp_uart_puts(" ms] ");
+            bsp_uart_puts(bsp_trace_type_str(buf[idx].type));
+            bsp_uart_puts(" Task=#");
+            bsp_uart_putdec((u32)buf[idx].task_id);
+            bsp_uart_puts(" arg1=");
+            bsp_uart_putdec((u32)buf[idx].arg1);
+            bsp_uart_puts(" arg2=");
+            bsp_uart_putdec(buf[idx].arg2);
+            bsp_uart_puts("\n");
+            i = i + 1;
+        }
+    } else if bsp_streq(cmd, "sensor") || bsp_streq(cmd, "temp") || bsp_streq(cmd, "queue") {
+        bsp_uart_puts("Sensor Temperature : ");
+        bsp_uart_putdec(latest_temp);
+        bsp_uart_puts(" C\n");
+        bsp_uart_puts("IPC Queue Pending  : ");
+        bsp_uart_putdec(rtos::rtos_queue_count(sensor_q));
+        bsp_uart_puts(" / ");
+        if sensor_q != NULL {
+            bsp_uart_putdec(sensor_q.capacity);
+        } else {
+            bsp_uart_putdec(0);
+        }
+        bsp_uart_puts(" msgs\n");
+        bsp_uart_puts("User LED (GPIO1_5) : ");
+        if bsp_get_led() {
+            bsp_uart_puts("ON");
+        } else {
+            bsp_uart_puts("OFF");
+        }
+        if *led_auto_blink != 0 {
+            bsp_uart_puts(" (Auto-Blink 1Hz)\n");
+        } else {
+            bsp_uart_puts(" (Manual Override)\n");
+        }
+    } else if bsp_streq(cmd, "mem") || bsp_streq(cmd, "stack") {
+        let ovf: u32 = rtos::rtos_check_stack_overflow();
+        bsp_uart_puts("Stack Canary Check (0xDEADBEEF): ");
+        if ovf == 0 {
+            bsp_uart_puts("PASS (All task stacks intact)\n");
+        } else {
+            bsp_uart_puts("FAIL! Overflow in Task #");
+            bsp_uart_putdec(ovf);
+            bsp_uart_puts("\n");
+        }
+        let stats: rtos::rtos_stats_t;
+        rtos::rtos_get_stats(&stats);
+        let id: u32 = 1;
+        while id <= stats.task_count {
+            let t: rtos::tcb_t* = (rtos::tcb_t*)rtos::rtos_get_task_by_id(id);
+            if t != NULL {
+                let free_b: u32 = rtos::rtos_task_stack_free_words(id) * 4;
+                let tot_b: u32 = t.stack_size * 4;
+                let used_b: u32 = tot_b - free_b;
+                bsp_uart_puts("  Task #");
+                bsp_uart_putdec(id);
+                bsp_uart_puts(" [");
+                bsp_uart_puts((char*)t.name);
+                bsp_uart_puts("]: Used Peak=");
+                bsp_uart_putdec(used_b);
+                bsp_uart_puts("B, Free High-Watermark=");
+                bsp_uart_putdec(free_b);
+                bsp_uart_puts("B / ");
+                bsp_uart_putdec(tot_b);
+                bsp_uart_puts("B\n");
+            }
+            id = id + 1;
+        }
+    } else if bsp_streq(cmd, "led on") || bsp_streq(cmd, "ledon") {
+        *led_auto_blink = 0;
+        bsp_set_led(true);
+        bsp_uart_puts("LED (GPIO1_IO05) set to ON (manual mode).\n");
+    } else if bsp_streq(cmd, "led off") || bsp_streq(cmd, "ledoff") {
+        *led_auto_blink = 0;
+        bsp_set_led(false);
+        bsp_uart_puts("LED (GPIO1_IO05) set to OFF (manual mode).\n");
+    } else if bsp_streq(cmd, "led toggle") || bsp_streq(cmd, "ledtoggle") {
+        *led_auto_blink = 0;
+        bsp_toggle_led();
+        bsp_uart_puts("LED (GPIO1_IO05) toggled -> ");
+        if bsp_get_led() {
+            bsp_uart_puts("ON\n");
+        } else {
+            bsp_uart_puts("OFF\n");
+        }
+    } else if bsp_streq(cmd, "led blink") || bsp_streq(cmd, "ledblink") {
+        *led_auto_blink = 1;
+        bsp_uart_puts("LED (GPIO1_IO05) returned to automatic 1 Hz RTOS blink task.\n");
+    } else if bsp_streq(cmd, "log on") || bsp_streq(cmd, "logon") || bsp_streq(cmd, "log 1") {
+        *telemetry_log_on = 1;
+        bsp_uart_puts("Periodic telemetry broadcast ENABLED.\n");
+    } else if bsp_streq(cmd, "log off") || bsp_streq(cmd, "logoff") || bsp_streq(cmd, "log 0") || bsp_streq(cmd, "quiet") || bsp_streq(cmd, "stop") {
+        *telemetry_log_on = 0;
+        bsp_uart_puts("Periodic telemetry broadcast DISABLED.\n");
+    } else if bsp_streq(cmd, "fault") {
+        bsp_uart_puts("Fault Status: ");
+        if rtos::g_fault_info.active != 0 {
+            bsp_uart_puts("ACTIVE FAULT RECORDED\n");
+        } else {
+            bsp_uart_puts("NONE (Healthy)\n");
+        }
+        bsp_uart_puts("  PC   = "); bsp_uart_puthex(rtos::g_fault_info.pc);
+        bsp_uart_puts("  LR   = "); bsp_uart_puthex(rtos::g_fault_info.lr); bsp_uart_puts("\n");
+        bsp_uart_puts("  CFSR = "); bsp_uart_puthex(rtos::g_fault_info.cfsr);
+        bsp_uart_puts("  HFSR = "); bsp_uart_puthex(rtos::g_fault_info.hfsr); bsp_uart_puts("\n");
+    } else if bsp_streq(cmd, "uptime") {
+        let ticks: u32 = rtos::rtos_get_tick();
+        bsp_uart_puts("Uptime: ");
+        bsp_uart_putdec(ticks / 1000);
+        bsp_uart_putc('.');
+        let ms: u32 = ticks % 1000;
+        if ms < 100 {
+            bsp_uart_putc('0');
+        }
+        if ms < 10 {
+            bsp_uart_putc('0');
+        }
+        bsp_uart_putdec(ms);
+        bsp_uart_puts(" s (");
+        bsp_uart_putdec(ticks);
+        bsp_uart_puts(" ticks)\n");
+    } else if bsp_streq(cmd, "clear") || bsp_streq(cmd, "cls") {
+        bsp_uart_puts("\x1b[2J\x1b[H");
+    } else if bsp_streq(cmd, "reboot") || bsp_streq(cmd, "reset") {
+        bsp_uart_puts("Rebooting NXP i.MX RT1021...\n");
+        mmio_write32(SCB_AIRCR_ADDR, 0x05FA0004);
+        while true {}
+    } else {
+        bsp_uart_puts("Unknown command: '");
+        bsp_uart_puts(cmd);
+        bsp_uart_puts("'. Type 'help' for available commands.\n");
+    }
+}
+
+fn bsp_shell_poll(sensor_q: rtos::rtos_queue_t*, latest_temp: u32,
+                  led_auto_blink: u32*, telemetry_log_on: u32*) {
+    let c: char = 0;
+
+    while bsp_uart_getc(&c) {
+        if g_shell_esc_state == 1 {
+            if c == '[' {
+                g_shell_esc_state = 2;
+            } else {
+                g_shell_esc_state = 0;
+            }
+            continue;
+        } else if g_shell_esc_state == 2 {
+            if (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '~' {
+                g_shell_esc_state = 0;
+            }
+            continue;
+        }
+        if (u8)c == 0x1B {
+            g_shell_esc_state = 1;
+            continue;
+        }
+
+        if (c == '\n' && g_shell_last_eol == '\r') || (c == '\r' && g_shell_last_eol == '\n') {
+            g_shell_last_eol = 0;
+            continue;
+        }
+
+        if c == '\r' || c == '\n' {
+            g_shell_last_eol = c;
+            bsp_uart_puts("\n");
+            g_shell_cmd_buf[g_shell_cmd_len] = '\0';
+            while g_shell_cmd_len > 0 &&
+                  (g_shell_cmd_buf[g_shell_cmd_len - 1] == ' ' ||
+                   g_shell_cmd_buf[g_shell_cmd_len - 1] == '\t') {
+                g_shell_cmd_len = g_shell_cmd_len - 1;
+                g_shell_cmd_buf[g_shell_cmd_len] = '\0';
+            }
+            bsp_shell_exec(&g_shell_cmd_buf[0], sensor_q, latest_temp,
+                           led_auto_blink, telemetry_log_on);
+            g_shell_cmd_len = 0;
+            bsp_shell_prompt();
+        } else {
+            g_shell_last_eol = 0;
+            if c == '\b' || (u8)c == 0x7F {
+                if g_shell_cmd_len > 0 {
+                    g_shell_cmd_len = g_shell_cmd_len - 1;
+                    bsp_uart_puts("\b \b");
+                }
+            } else if (u8)c >= 0x20 && (u8)c < 0x7F {
+                if g_shell_cmd_len < 63 {
+                    g_shell_cmd_buf[g_shell_cmd_len] = c;
+                    g_shell_cmd_len = g_shell_cmd_len + 1;
+                    bsp_uart_putc(c);
+                }
+            }
+        }
+    }
+}

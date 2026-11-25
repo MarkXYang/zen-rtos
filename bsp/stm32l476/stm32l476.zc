@@ -55,6 +55,10 @@ fn mmio_write32(_addr: u32, _val: u32) {
     raw { *(volatile uint32_t *)(uintptr_t)_addr = _val; }
 }
 
+fn bsp_get_cpu_freq_hz() -> u32 {
+    return 4000000; // 4 MHz MSI default boot clock
+}
+
 fn bsp_init_led() {
     // Enable GPIOA clock (bit 0)
     let ahb2: u32 = mmio_read32(RCC_AHB2ENR_ADDR);

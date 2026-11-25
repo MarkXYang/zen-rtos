@@ -61,6 +61,11 @@ fn mmio_write32(_addr: u32, _val: u32) {
     raw { *(volatile uint32_t *)(uintptr_t)_addr = _val; }
 }
 
+// Exported for app/main.zc
+fn bsp_get_cpu_freq_hz() -> u32 {
+    return 160000000; // 160 MHz SPLL
+}
+
 // Exported for bsp/esp32c6/startup.s (call bsp_disable_watchdogs)
 @used
 fn bsp_disable_watchdogs() {
