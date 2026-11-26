@@ -53,6 +53,8 @@ SECTIONS
         *(.wifislprxiram.*)
         *(.phyiram)
         *(.phyiram.*)
+        *(.coexiram)
+        *(.coexiram.*)
         . = ALIGN(4);
         _eiram = .;
     } > SRAM AT > FLASH

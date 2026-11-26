@@ -245,6 +245,16 @@ int phy_printf(const char *fmt, ...) {
     return r;
 }
 
+int coexist_printf(const char *fmt, ...) {
+    char buf[128];
+    va_list ap;
+    va_start(ap, fmt);
+    int r = vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    bsp_uart_puts(buf);
+    return r;
+}
+
 double floor(double x) {
     int64_t i = (int64_t)x;
     return (x < (double)i) ? (double)(i - 1) : (double)i;

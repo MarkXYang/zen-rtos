@@ -15,12 +15,13 @@ extern fn bsp_init_uart(cpu_freq_hz: u32, baud: u32);
 extern fn bsp_uart_puts(s: char*);
 
 def STACK_SIZE_WORDS = 256;
+def SHELL_STACK_WORDS = 1024;
 def SENSOR_QUEUE_CAP = 8;
 
 let stack_led: u32[256];
 let stack_sensor: u32[256];
 let stack_telemetry: u32[256];
-let stack_shell: u32[256];
+let stack_shell: u32[1024];
 
 let g_sensor_mutex: rtos::rtos_mutex_t;
 let g_sensor_queue: rtos::rtos_queue_t;
@@ -91,7 +92,7 @@ fn main() -> int {
 
     // Create tasks: Priority 5 (Sensor), Priority 6 (Shell), Priority 8 (Telemetry), Priority 10 (LED)
     rtos::rtos_task_create(task_sensor_poll, NULL, 5, &stack_sensor[0], STACK_SIZE_WORDS, "Sensor");
-    rtos::rtos_task_create(task_shell, NULL, 6, &stack_shell[0], STACK_SIZE_WORDS, "Shell");
+    rtos::rtos_task_create(task_shell, NULL, 6, &stack_shell[0], SHELL_STACK_WORDS, "Shell");
     rtos::rtos_task_create(task_telemetry_report, NULL, 8, &stack_telemetry[0], STACK_SIZE_WORDS, "Telemetry");
     rtos::rtos_task_create(task_led_blink, NULL, 10, &stack_led[0], STACK_SIZE_WORDS, "BlinkLED");
 

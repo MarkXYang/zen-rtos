@@ -7,11 +7,16 @@
 #include <stddef.h>
 #include <stdarg.h>
 #include "rtos.h"
+#include "wifi_os_adapter.h"
+#include "esp_wifi.h"
+#include "phy.h"
+#include "phy_init_data.h"
 
 // ---------------------------------------------------------------------------
-// External ZenRTOS & BSP Helpers
+// External ZenRTOS, ROM & BSP Helpers
 // ---------------------------------------------------------------------------
 extern void     bsp_uart_puts(const char *s);
+extern int      snprintf(char *buf, size_t cap, const char *fmt, ...);
 extern void    *wifi_heap_malloc(size_t size);
 extern void    *wifi_heap_calloc(size_t nmemb, size_t size);
 extern void    *wifi_heap_realloc(void *ptr, size_t size);
@@ -22,34 +27,73 @@ extern void    *memcpy(void *dst, const void *src, size_t n);
 extern void    *memset(void *dst, int c, size_t n);
 extern size_t   strlen(const char *s);
 extern char    *strncpy(char *dst, const char *src, size_t n);
+extern void     esp_rom_route_intr_matrix(int cpu_no, uint32_t model_num, uint32_t intr_num);
+extern void     esprv_intc_int_set_priority(int rv_int_num, int priority);
+extern void     esprv_intc_int_set_threshold(int priority_threshold);
+extern void     esprv_intc_int_enable(uint32_t unmask);
+extern void     esprv_intc_int_disable(uint32_t mask);
+extern void     esprv_intc_int_set_type(int intr_num, int type);
+extern void     esp_rom_delay_us(uint32_t us);
+extern void     ets_update_cpu_frequency(uint32_t ticks_per_us);
+extern void     phy_init_param_set(uint8_t param);
+extern void     phy_wifi_enable_set(uint8_t enable);
+extern void     phy_bbpll_en_usb(bool en);
+extern void     bt_track_pll_cap(void);
+extern void     coex_hw_clear_reg(void);
 extern volatile uint32_t g_isr_nest_depth;
 
 // ---------------------------------------------------------------------------
-// ESP32-C6 Hardware Registers (EFUSE, INTMTX, PLIC_MX, CLINT, MODEM, RNG)
+// ESP32-C6 Hardware Registers (EFUSE, PLIC_MX, CLINT, MODEM_SYSCON/LPCON, RNG)
 // ---------------------------------------------------------------------------
-#define EFUSE_RD_MAC_SPI_SYS_0_REG  (*(volatile uint32_t *)0x600B0844UL)
-#define EFUSE_RD_MAC_SPI_SYS_1_REG  (*(volatile uint32_t *)0x600B0848UL)
+#define EFUSE_RD_MAC_SPI_SYS_0_REG      (*(volatile uint32_t *)0x600B0844UL)
+#define EFUSE_RD_MAC_SPI_SYS_1_REG      (*(volatile uint32_t *)0x600B0848UL)
 
-#define INTMTX_BASE                 (0x60010000UL)
-#define INTMTX_CORE0_MAP_REG(src)   (*(volatile uint32_t *)(INTMTX_BASE + ((src) * 4UL)))
+#define PLIC_MX_BASE                    (0x20001000UL)
+#define PLIC_MX_ENABLE_REG              (*(volatile uint32_t *)(PLIC_MX_BASE + 0x0000UL))
+#define PLIC_MX_TYPE_REG                (*(volatile uint32_t *)(PLIC_MX_BASE + 0x0004UL))
+#define PLIC_MX_CLEAR_REG               (*(volatile uint32_t *)(PLIC_MX_BASE + 0x0008UL))
+#define PLIC_MX_PRI_REG(num)            (*(volatile uint32_t *)(PLIC_MX_BASE + 0x0010UL + ((num) * 4UL)))
+#define PLIC_MX_THRESH_REG              (*(volatile uint32_t *)(PLIC_MX_BASE + 0x0090UL))
 
-#define PLIC_MX_BASE                (0x20001000UL)
-#define PLIC_MX_ENABLE_REG          (*(volatile uint32_t *)(PLIC_MX_BASE + 0x0000UL))
-#define PLIC_MX_TYPE_REG            (*(volatile uint32_t *)(PLIC_MX_BASE + 0x0004UL))
-#define PLIC_MX_CLEAR_REG           (*(volatile uint32_t *)(PLIC_MX_BASE + 0x0008UL))
-#define PLIC_MX_THRESH_REG          (*(volatile uint32_t *)(PLIC_MX_BASE + 0x000CUL))
-#define PLIC_MX_PRI_REG(num)        (*(volatile uint32_t *)(PLIC_MX_BASE + 0x0010UL + ((num) * 4UL)))
+#define CLINT_MTIME_LO_REG              (*(volatile uint32_t *)0x20001808UL)
+#define CLINT_MTIME_HI_REG              (*(volatile uint32_t *)0x2000180CUL)
 
-#define CLINT_MTIME_LO_REG          (*(volatile uint32_t *)0x20001808UL)
-#define CLINT_MTIME_HI_REG          (*(volatile uint32_t *)0x2000180CUL)
+#define MODEM_SYSCON_TEST_CONF_REG      (*(volatile uint32_t *)0x600A9800UL)
+#define MODEM_SYSCON_CLK_CONF_REG       (*(volatile uint32_t *)0x600A9804UL)
+#define MODEM_SYSCON_CLK_FORCE_REG      (*(volatile uint32_t *)0x600A9808UL)
+#define MODEM_SYSCON_CLK_POWER_ST_REG   (*(volatile uint32_t *)0x600A980CUL)
+#define MODEM_SYSCON_RST_CONF_REG       (*(volatile uint32_t *)0x600A9810UL)
+#define MODEM_SYSCON_CLK_CONF1_REG      (*(volatile uint32_t *)0x600A9814UL)
+#define MODEM_SYSCON_CLK_FORCE1_REG     (*(volatile uint32_t *)0x600A9818UL)
 
-#define MODEM_SYSCON_CLK_CONF_REG   (*(volatile uint32_t *)0x600A9808UL)
-#define MODEM_SYSCON_CLK_CONF1_REG  (*(volatile uint32_t *)0x600A980CUL)
-#define MODEM_SYSCON_RST_CONF_REG   (*(volatile uint32_t *)0x600A9814UL)
-#define MODEM_LPCON_CLK_CONF_REG    (*(volatile uint32_t *)0x600AF018UL)
-#define MODEM_LPCON_RST_CONF_REG    (*(volatile uint32_t *)0x600AF024UL)
+#define MODEM_LPCON_COEX_LP_CLK_REG     (*(volatile uint32_t *)0x600AF008UL)
+#define MODEM_LPCON_WIFI_LP_CLK_REG     (*(volatile uint32_t *)0x600AF00CUL)
+#define MODEM_LPCON_I2C_MST_CLK_REG     (*(volatile uint32_t *)0x600AF010UL)
+#define MODEM_LPCON_CLK_CONF_REG        (*(volatile uint32_t *)0x600AF018UL)
+#define MODEM_LPCON_CLK_FORCE_REG       (*(volatile uint32_t *)0x600AF01CUL)
+#define MODEM_LPCON_CLK_POWER_ST_REG    (*(volatile uint32_t *)0x600AF020UL)
+#define MODEM_LPCON_RST_CONF_REG        (*(volatile uint32_t *)0x600AF024UL)
+#define I2C_MST_ANA_CONF0_REG           (*(volatile uint32_t *)0x600AF818UL)
+#define ANA_CONFIG_REG                  (*(volatile uint32_t *)0x600AF81CUL)
+#define ANA_CONFIG2_REG                 (*(volatile uint32_t *)0x600AF820UL)
 
-#define LP_WDEV_RNG_DATA_REG        (*(volatile uint32_t *)0x600B2800UL)
+#define PMU_HP_ACTIVE_DIG_POWER_REG     (*(volatile uint32_t *)0x600B0000UL)
+#define PMU_HP_ACTIVE_ICG_FUNC_REG      (*(volatile uint32_t *)0x600B0004UL)
+#define PMU_HP_ACTIVE_ICG_APB_REG       (*(volatile uint32_t *)0x600B0008UL)
+#define PMU_HP_ACTIVE_ICG_MODEM_REG     (*(volatile uint32_t *)0x600B000CUL)
+#define PMU_HP_ACTIVE_HP_CK_POWER_REG   (*(volatile uint32_t *)0x600B0014UL)
+#define PMU_HP_ACTIVE_BIAS_REG          (*(volatile uint32_t *)0x600B0018UL)
+#define PMU_IMM_HP_CK_POWER_REG         (*(volatile uint32_t *)0x600B00CCUL)
+#define PMU_IMM_SLEEP_SYSCLK_REG        (*(volatile uint32_t *)0x600B00D0UL)
+#define PMU_IMM_HP_FUNC_ICG_REG         (*(volatile uint32_t *)0x600B00D4UL)
+#define PMU_IMM_HP_APB_ICG_REG          (*(volatile uint32_t *)0x600B00D8UL)
+#define PMU_IMM_MODEM_ICG_REG           (*(volatile uint32_t *)0x600B00DCUL)
+#define PMU_IMM_I2C_ISO_REG             (*(volatile uint32_t *)0x600B00E8UL)
+#define PMU_POWER_PD_HPWIFI_CNTL_REG    (*(volatile uint32_t *)0x600B0104UL)
+#define PMU_RF_PWC_REG                  (*(volatile uint32_t *)0x600B0154UL)
+#define PCR_PLL_DIV_CLK_EN_REG          (*(volatile uint32_t *)0x60096114UL)
+
+#define LP_WDEV_RNG_DATA_REG            (*(volatile uint32_t *)0x600B2800UL)
 
 // ---------------------------------------------------------------------------
 // ESP32-C6 External Interrupt Dispatch (called from arch/riscv/rv32/context.s)
@@ -57,8 +101,10 @@ extern volatile uint32_t g_isr_nest_depth;
 typedef void (*ext_isr_fn_t)(void *arg);
 static ext_isr_fn_t g_ext_isr_fn[32];
 static void        *g_ext_isr_arg[32];
+static volatile uint32_t g_wifi_irq_count = 0;
 
 void bsp_riscv_ext_irq_dispatch(uint32_t irq_num) {
+    g_wifi_irq_count++;
     if (irq_num < 32 && g_ext_isr_fn[irq_num] != NULL) {
         g_ext_isr_fn[irq_num](g_ext_isr_arg[irq_num]);
     }
@@ -260,32 +306,45 @@ static uint32_t osi_event_group_wait_bits(void *event, uint32_t wait_bits, int c
     }
 }
 
-// Espressif ets_timer struct begins with 20+ bytes; store rtos_timer_t* in its priv slot
+// Side-table mapping opaque ETSTimer* pointers to ZenRTOS rtos_timer_t (zero mutation of ETSTimer fields!)
+#define MAX_OSI_TIMERS 48
 typedef struct {
-    void        *next;
-    uint32_t     expire;
-    uint32_t     period;
-    void       (*func)(void *);
-    void        *priv;
-} ets_timer_compat_t;
+    void         *ptimer_key;
+    rtos_timer_t  rt;
+} osi_timer_slot_t;
+
+static osi_timer_slot_t s_timer_slots[MAX_OSI_TIMERS];
+
+static rtos_timer_t *osi_find_or_alloc_timer(void *ptimer, bool alloc_if_missing) {
+    if (!ptimer) return NULL;
+    for (int i = 0; i < MAX_OSI_TIMERS; i++) {
+        if (s_timer_slots[i].ptimer_key == ptimer) {
+            return &s_timer_slots[i].rt;
+        }
+    }
+    if (!alloc_if_missing) return NULL;
+    for (int i = 0; i < MAX_OSI_TIMERS; i++) {
+        if (s_timer_slots[i].ptimer_key == NULL) {
+            s_timer_slots[i].ptimer_key = ptimer;
+            memset(&s_timer_slots[i].rt, 0, sizeof(rtos_timer_t));
+            return &s_timer_slots[i].rt;
+        }
+    }
+    return NULL;
+}
 
 static void osi_timer_setfn(void *ptimer, void *pfunction, void *parg) {
-    ets_timer_compat_t *et = (ets_timer_compat_t *)ptimer;
-    if (!et) return;
-    rtos_timer_t *rt = (rtos_timer_t *)et->next;
-    if (!rt) {
-        rt = (rtos_timer_t *)wifi_heap_calloc(1, sizeof(rtos_timer_t));
-        et->next = rt;
-    }
+    rtos_timer_t *rt = osi_find_or_alloc_timer(ptimer, true);
     if (rt) {
         rtos_timer_init(rt, (rtos_timer_cb_t)pfunction, parg);
     }
 }
 
 static void osi_timer_arm(void *ptimer, uint32_t tmout_ms, bool repeat) {
-    ets_timer_compat_t *et = (ets_timer_compat_t *)ptimer;
-    if (!et || !et->next) return;
-    rtos_timer_start((rtos_timer_t *)et->next, tmout_ms ? tmout_ms : 1U, repeat);
+    rtos_timer_t *rt = osi_find_or_alloc_timer(ptimer, false);
+    if (rt) {
+        rtos_timer_start(rt, tmout_ms ? tmout_ms : 1U, repeat);
+    }
 }
 
 static void osi_timer_arm_us(void *ptimer, uint32_t us, bool repeat) {
@@ -294,56 +353,75 @@ static void osi_timer_arm_us(void *ptimer, uint32_t us, bool repeat) {
 }
 
 static void osi_timer_disarm(void *ptimer) {
-    ets_timer_compat_t *et = (ets_timer_compat_t *)ptimer;
-    if (!et || !et->next) return;
-    rtos_timer_stop((rtos_timer_t *)et->next);
+    rtos_timer_t *rt = osi_find_or_alloc_timer(ptimer, false);
+    if (rt) rtos_timer_stop(rt);
 }
 
 static void osi_timer_done(void *ptimer) {
-    ets_timer_compat_t *et = (ets_timer_compat_t *)ptimer;
-    if (!et || !et->next) return;
-    rtos_timer_stop((rtos_timer_t *)et->next);
-    wifi_heap_free(et->next);
-    et->next = NULL;
+    if (!ptimer) return;
+    for (int i = 0; i < MAX_OSI_TIMERS; i++) {
+        if (s_timer_slots[i].ptimer_key == ptimer) {
+            rtos_timer_stop(&s_timer_slots[i].rt);
+            s_timer_slots[i].ptimer_key = NULL;
+            break;
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
-// Wi-Fi OSI Function Implementations
+// Wi-Fi OSI Function Implementations (Consistent IRQ Remap + PHY RF Init)
 // ---------------------------------------------------------------------------
 static bool osi_env_is_chip(void) { return true; }
 
-static void osi_set_intr(int32_t cpu_no, uint32_t intr_source, uint32_t intr_num, int32_t intr_prio) {
-    (void)cpu_no;
-    // Remap away from CLINT-reserved slots (0, 3, 4, 7) onto CPU IRQ 9/10 if requested
-    if (intr_num == 0 || intr_num == 3 || intr_num == 4 || intr_num == 7) {
-        intr_num = (intr_source == 0) ? 9U : 10U;
+// Remap CLINT-reserved slots (0, 3, 4, 7) deterministically; leave valid slots (e.g. ETS_WMAC_INUM=1) untouched
+static uint32_t remap_irq_num(uint32_t n) {
+    if (n == 0U) return 9U;
+    if (n == 3U) return 10U;
+    if (n == 4U) return 11U;
+    if (n == 7U) return 12U;
+    return n & 31U;
+}
+
+static uint32_t remap_irq_mask(uint32_t mask) {
+    uint32_t out = 0;
+    for (uint32_t b = 0; b < 32U; b++) {
+        if (mask & (1UL << b)) {
+            out |= (1UL << remap_irq_num(b));
+        }
     }
-    INTMTX_CORE0_MAP_REG(intr_source) = intr_num;
-    PLIC_MX_PRI_REG(intr_num) = (intr_prio > 0) ? (uint32_t)intr_prio : 1U;
-    PLIC_MX_THRESH_REG = 0;
+    return out;
+}
+
+static void osi_set_intr(int32_t cpu_no, uint32_t intr_source, uint32_t intr_num, int32_t intr_prio) {
+    uint32_t hw_num = remap_irq_num(intr_num);
+    esp_rom_route_intr_matrix(cpu_no, intr_source, hw_num);
+    esprv_intc_int_set_type((int)hw_num, 0); // 0 = INTR_TYPE_LEVEL
+    esprv_intc_int_set_priority((int)hw_num, (intr_prio > 0) ? (int)intr_prio : 2);
+    esprv_intc_int_set_threshold(0);         // 0 = allow all priorities >= 1 (including WIFI_MAC prio=1!)
 }
 
 static void osi_clear_intr(uint32_t intr_source, uint32_t intr_num) {
     (void)intr_source;
-    PLIC_MX_CLEAR_REG = (1UL << intr_num);
+    uint32_t hw_num = remap_irq_num(intr_num);
+    PLIC_MX_CLEAR_REG |= (1UL << hw_num);
+    PLIC_MX_CLEAR_REG &= ~(1UL << hw_num);
 }
 
 static void osi_set_isr(int32_t n, void *f, void *arg) {
-    if (n == 0 || n == 3 || n == 4 || n == 7) n = 9;
-    if (n >= 0 && n < 32) {
-        g_ext_isr_fn[n]  = (ext_isr_fn_t)f;
-        g_ext_isr_arg[n] = arg;
-    }
+    if (n < 0) return;
+    uint32_t hw_num = remap_irq_num((uint32_t)n);
+    g_ext_isr_fn[hw_num]  = (ext_isr_fn_t)f;
+    g_ext_isr_arg[hw_num] = arg;
 }
 
 static void osi_ints_on(uint32_t mask) {
-    PLIC_MX_ENABLE_REG |= mask;
-    __asm volatile ("csrs mie, %0" : : "r"(mask));
+    uint32_t hw_mask = remap_irq_mask(mask);
+    esprv_intc_int_enable(hw_mask);
 }
 
 static void osi_ints_off(uint32_t mask) {
-    PLIC_MX_ENABLE_REG &= ~mask;
-    __asm volatile ("csrc mie, %0" : : "r"(mask));
+    uint32_t hw_mask = remap_irq_mask(mask);
+    esprv_intc_int_disable(hw_mask);
 }
 
 static bool osi_is_from_isr(void) { return g_isr_nest_depth > 0; }
@@ -373,14 +451,18 @@ static int32_t osi_semphr_give(void *s) {
     return 1;
 }
 
-static rtos_sem_t g_wifi_thread_sem;
-static bool g_wifi_thread_sem_init = false;
+// Thread-local semaphore per ZenRTOS task ID (0..RTOS_MAX_TASKS) for synchronous Wi-Fi IPC calls
+static rtos_sem_t g_wifi_thread_sems[RTOS_MAX_TASKS + 1];
+static bool       g_wifi_thread_sem_init[RTOS_MAX_TASKS + 1];
+
 static void *osi_wifi_thread_semphr_get(void) {
-    if (!g_wifi_thread_sem_init) {
-        rtos_sem_init(&g_wifi_thread_sem, 0, 1);
-        g_wifi_thread_sem_init = true;
+    tcb_t *cur = rtos_get_current_task();
+    uint32_t idx = (cur && cur->id <= RTOS_MAX_TASKS) ? cur->id : 0U;
+    if (!g_wifi_thread_sem_init[idx]) {
+        rtos_sem_init(&g_wifi_thread_sems[idx], 0, 1);
+        g_wifi_thread_sem_init[idx] = true;
     }
-    return &g_wifi_thread_sem;
+    return &g_wifi_thread_sems[idx];
 }
 
 static void *osi_mutex_create(void) {
@@ -440,16 +522,106 @@ static int osi_read_mac(uint8_t *mac, unsigned int type) {
     return 0;
 }
 
+// Critical section hooks called directly by libphy.a
+uint32_t phy_enter_critical(void) {
+    return rtos_irq_save();
+}
+
+void phy_exit_critical(uint32_t level) {
+    rtos_irq_restore(level);
+}
+
+static bool s_bbpll_inited = false;
+
+static void bsp_bbpll_480m_init_and_pmu_modem_on(void) {
+    ets_update_cpu_frequency(160);
+    // 1. Power on Wi-Fi digital domain, BBPLL, and latch PMU HP_ACTIVE ICG state (ESP-IDF pmu_init + clk_ll_bbpll_enable)
+    PMU_POWER_PD_HPWIFI_CNTL_REG  = 0UL;                        // Clear force PD/ISO/RST on HPWIFI domain
+    PMU_HP_ACTIVE_DIG_POWER_REG  &= ~(1UL << 27);               // Clear PD_HP_WIFI_PD_EN
+    PMU_HP_ACTIVE_HP_CK_POWER_REG = (1UL << 28) | (1UL << 29) | (1UL << 30); // XPD_BB_I2C | XPD_BBPLL_I2C | XPD_BBPLL
+    PMU_HP_ACTIVE_ICG_FUNC_REG    = 0xFFFFFFFFUL;
+    PMU_HP_ACTIVE_ICG_APB_REG     = 0xFFFFFFFFUL;
+    PMU_HP_ACTIVE_ICG_MODEM_REG   = (2UL << 30);                // PMU_HP_ICG_MODEM_CODE_ACTIVE = 2
+    PMU_IMM_HP_CK_POWER_REG       = (1UL << 28) | (1UL << 29) | (1UL << 30); // TIE_HIGH XPD_BB_I2C/BBPLL_I2C/BBPLL
+    PMU_IMM_HP_CK_POWER_REG       = (1UL << 25);                // TIE_HIGH_GLOBAL_BBPLL_ICG
+    PMU_IMM_HP_FUNC_ICG_REG       = (1UL << 31);                // PMU_UPDATE_DIG_ICG_FUNC_EN
+    PMU_IMM_HP_APB_ICG_REG        = (1UL << 31);                // PMU_UPDATE_DIG_ICG_APB_EN
+    PMU_IMM_MODEM_ICG_REG         = (1UL << 31);                // PMU_UPDATE_DIG_ICG_MODEM_EN
+    PMU_IMM_SLEEP_SYSCLK_REG      = (1UL << 28);                // PMU_UPDATE_DIG_ICG_SWITCH
+    PMU_RF_PWC_REG               |= (1UL << 26) | (1UL << 27);  // PMU_PERIF_I2C_RSTB | PMU_XPD_PERIF_I2C
+    PCR_PLL_DIV_CLK_EN_REG       |= 0xFFFFFFFFUL;
+
+    // 2. Ungate analog I2C master
+    MODEM_LPCON_I2C_MST_CLK_REG  |= (1UL << 0);                 // CLK_I2C_MST_SEL_160M
+    MODEM_LPCON_CLK_CONF_REG     |= (1UL << 2);                 // CLK_I2C_MST_EN
+    ANA_CONFIG_REG               &= ~((1UL << 18) | (1UL << 17));
+    ANA_CONFIG2_REG              |= (1UL << 16);
+    s_bbpll_inited = true;
+}
+
+static bool s_modem_clk_inited = false;
+
 static void osi_wifi_clock_enable(void) {
-    MODEM_SYSCON_CLK_CONF_REG  |= 0xFFFFFFFFUL;
-    MODEM_SYSCON_CLK_CONF1_REG |= 0xFFFFFFFFUL;
-    MODEM_LPCON_CLK_CONF_REG   |= 0xFFFFFFFFUL;
+    if (s_modem_clk_inited) return;
+    s_modem_clk_inited = true;
+    bsp_bbpll_480m_init_and_pmu_modem_on();
+
+    // Configure Modem ICG power-state bitmaps (BIT(2)=ACTIVE, BIT(1)=MODEM) per ESP-IDF modem_clock.c
+    MODEM_SYSCON_CLK_POWER_ST_REG |= 0x64646400UL;              // APB=6, PERI=4, WIFI=6, BT=4, FE=6, ZB=4
+    MODEM_LPCON_CLK_POWER_ST_REG  |= 0x66660000UL;              // LP_APB=6, I2C_MST=6, COEX=6, WIFIPWR=6
+
+    // Enable Wi-Fi BB, Wi-Fi MAC, Wi-Fi APB, and PHY FE clocks (preserve DATA_DUMP_MUX & libphy dynamic bits)
+    MODEM_SYSCON_TEST_CONF_REG    |= 1UL;
+    MODEM_SYSCON_CLK_CONF1_REG    |= 0x0001E7FFUL;
+
+    // Select ~136 kHz RC_SLOW (OSC_SLOW, div=0) for Wi-Fi & Coex LP clocks and enable LPCON modules
+    MODEM_LPCON_WIFI_LP_CLK_REG    = (1UL << 0);
+    MODEM_LPCON_COEX_LP_CLK_REG    = (1UL << 0);
+    MODEM_LPCON_CLK_CONF_REG      |= (1UL << 0) | (1UL << 1) | (1UL << 2); // WIFIPWR | COEX | I2C_MST
+    coex_hw_clear_reg();
 }
 
 static void osi_wifi_clock_disable(void) {}
+
 static void osi_wifi_reset_mac(void) {
-    MODEM_SYSCON_RST_CONF_REG |= (1UL << 8);
-    MODEM_SYSCON_RST_CONF_REG &= ~(1UL << 8);
+    // Only reset WIFIMAC (bit 10); NEVER reset WIFIBB (bit 8) which wipes PHY baseband calibration!
+    MODEM_SYSCON_RST_CONF_REG |= (1UL << 10);
+    MODEM_SYSCON_RST_CONF_REG &= ~(1UL << 10);
+}
+
+static bool s_phy_calibrated = false;
+static bool s_phy_enabled    = false;
+static esp_phy_calibration_data_t *s_phy_cal_data = NULL;
+
+static void osi_phy_enable(void) {
+    if (!s_phy_enabled) {
+        osi_wifi_clock_enable();
+        if (!s_phy_calibrated) {
+            phy_init_param_set(1); // SOC_PHY_COMBO_MODULE = 1 on ESP32-C6
+            phy_bbpll_en_usb(true);
+            if (!s_phy_cal_data) {
+                s_phy_cal_data = (esp_phy_calibration_data_t *)wifi_heap_calloc(1, sizeof(esp_phy_calibration_data_t));
+            }
+            if (s_phy_cal_data) {
+                wifi_drv_read_mac(s_phy_cal_data->mac);
+                (void)register_chipv7_phy(&phy_init_data, s_phy_cal_data, PHY_RF_CAL_FULL);
+                s_phy_calibrated = true;
+            }
+        } else {
+            phy_wakeup_init();
+        }
+        s_phy_enabled = true;
+    }
+    bt_track_pll_cap();
+    phy_wifi_enable_set(1);
+}
+
+static void osi_phy_disable(void) {
+    phy_wifi_enable_set(0);
+    if (!s_phy_enabled) return;
+    phy_close_rf();
+    phy_xpd_tsens();
+    s_phy_enabled = false;
 }
 
 static void osi_noop(void) {}
@@ -493,14 +665,13 @@ static int osi_nvs_get_blob(uint32_t h, const char *k, void *v, size_t *l) { (vo
 static int osi_nvs_erase(uint32_t h, const char *k) { (void)h; (void)k; return 0; }
 
 static void osi_log_writev(unsigned int level, const char *tag, const char *fmt, va_list args) {
-    if (level > 2U) return; // Print errors & warnings only
-    char buf[128];
+    if (level > 2U) return; // Print Error & Warn only
+    char buf[160];
     vsnprintf(buf, sizeof(buf), fmt, args);
-    bsp_uart_puts("[wifi/");
-    bsp_uart_puts(tag ? tag : "drv");
+    bsp_uart_puts("[");
+    bsp_uart_puts(tag ? tag : "wifi");
     bsp_uart_puts("] ");
     bsp_uart_puts(buf);
-    bsp_uart_puts("\n");
 }
 static void osi_log_write(unsigned int level, const char *tag, const char *fmt, ...) {
     va_list ap;
@@ -510,157 +681,120 @@ static void osi_log_write(unsigned int level, const char *tag, const char *fmt, 
 }
 static uint32_t osi_log_timestamp(void) { return rtos_get_tick(); }
 
-// Coex & Sleep-retention stubs (Wi-Fi-only Phase 1)
-static uint32_t osi_coex_status(void) { return 0; }
+// Real libcoexist.a integration for ESP32-C6 shared 2.4 GHz RF arbiter
+typedef struct {
+    int32_t  _version;
+    void    (*_task_yield_from_isr)(void);
+    void   *(*_semphr_create)(uint32_t max, uint32_t init);
+    void    (*_semphr_delete)(void *semphr);
+    int32_t (*_semphr_take_from_isr)(void *semphr, void *hptw);
+    int32_t (*_semphr_give_from_isr)(void *semphr, void *hptw);
+    int32_t (*_semphr_take)(void *semphr, uint32_t block_time_tick);
+    int32_t (*_semphr_give)(void *semphr);
+    int     (*_is_in_isr)(void);
+    void   *(*_malloc_internal)(size_t size);
+    void    (*_free)(void *p);
+    int64_t (*_esp_timer_get_time)(void);
+    bool    (*_env_is_chip)(void);
+    void    (*_timer_disarm)(void *timer);
+    void    (*_timer_done)(void *ptimer);
+    void    (*_timer_setfn)(void *ptimer, void *pfunction, void *parg);
+    void    (*_timer_arm_us)(void *ptimer, uint32_t us, bool repeat);
+    int     (*_debug_matrix_init)(int evt, int sig, bool rev);
+    uint32_t(*_slowclk_cal_get)(void);
+    int32_t  _magic;
+} coex_adapter_funcs_t;
+
+extern esp_err_t esp_coex_adapter_register(coex_adapter_funcs_t *funcs);
+extern esp_err_t coex_pre_init(void);
+extern int       coex_init(void);
+extern void      coex_deinit(void);
+extern int       coex_enable(void);
+extern void      coex_disable(void);
+extern uint32_t  coex_status_get(uint8_t type);
+extern int       coex_wifi_request(uint32_t event, uint32_t latency, uint32_t duration);
+extern int       coex_wifi_release(uint32_t event);
+extern int       coex_event_duration_get(uint32_t event, uint32_t *duration);
+extern int       coex_pti_get(uint32_t event, uint8_t *pti);
+extern int       coex_register_start_cb(int (*cb)(void));
+
+static int32_t osi_semphr_take_from_isr(void *s, void *hptw) {
+    (void)hptw;
+    return rtos_sem_wait((rtos_sem_t *)s, 0) ? 1 : 0;
+}
+static int32_t osi_semphr_give_from_isr(void *s, void *hptw) {
+    bool woken = false;
+    rtos_sem_signal_from_isr((rtos_sem_t *)s, &woken);
+    if (hptw && woken) *(int32_t *)hptw = 1;
+    return 1;
+}
+static int osi_is_in_isr_int(void) { return g_isr_nest_depth > 0 ? 1 : 0; }
+static int osi_coex_debug_matrix_noop(int evt, int sig, bool rev) { (void)evt; (void)sig; (void)rev; return 0; }
+
+static coex_adapter_funcs_t g_coex_adapter_funcs = {
+    ._version              = 2,
+    ._task_yield_from_isr  = osi_task_yield_from_isr,
+    ._semphr_create        = osi_semphr_create,
+    ._semphr_delete        = osi_semphr_delete,
+    ._semphr_take_from_isr = osi_semphr_take_from_isr,
+    ._semphr_give_from_isr = osi_semphr_give_from_isr,
+    ._semphr_take          = osi_semphr_take,
+    ._semphr_give          = osi_semphr_give,
+    ._is_in_isr            = osi_is_in_isr_int,
+    ._malloc_internal      = wifi_heap_malloc,
+    ._free                 = wifi_heap_free,
+    ._esp_timer_get_time   = bsp_timer_get_us,
+    ._env_is_chip          = osi_env_is_chip,
+    ._timer_disarm         = osi_timer_disarm,
+    ._timer_done           = osi_timer_done,
+    ._timer_setfn          = osi_timer_setfn,
+    ._timer_arm_us         = osi_timer_arm_us,
+    ._debug_matrix_init    = osi_coex_debug_matrix_noop,
+    ._slowclk_cal_get      = osi_slowclk_cal_get,
+    ._magic                = (int32_t)0xDEADBEAF,
+};
+
+static uint32_t osi_coex_status(void) { return coex_status_get(0); }
 static void osi_coex_cond(uint32_t t, bool d) { (void)t; (void)d; }
-static int  osi_coex_req(uint32_t e, uint32_t l, uint32_t d) { (void)e; (void)l; (void)d; return 0; }
-static int  osi_coex_rel(uint32_t e) { (void)e; return 0; }
 static int  osi_coex_ch(uint8_t p, uint8_t s) { (void)p; (void)s; return 0; }
-static int  osi_coex_dur(uint32_t e, uint32_t *d) { (void)e; if (d) *d = 0; return 0; }
-static int  osi_coex_pti(uint32_t e, uint8_t *p) { (void)e; if (p) *p = 0; return 0; }
 static void osi_coex_schm_u32(uint32_t t, uint32_t s) { (void)t; (void)s; }
-static int  osi_coex_schm_int(int v) { (void)v; return 0; }
+static int osi_coex_schm_int(uint32_t v) { (void)v; return 0; }
+static int osi_coex_ok_void(void) { return 0; }
 static uint32_t osi_coex_schm_get32(void) { return 0; }
 static uint8_t  osi_coex_schm_get8(void) { return 0; }
 static void    *osi_coex_schm_ptr(void) { return NULL; }
 static int  osi_coex_schm_cb(int a, int (*cb)(int)) { (void)a; (void)cb; return 0; }
-static int  osi_coex_start_cb(int (*cb)(void)) { (void)cb; return 0; }
 static void osi_regdma_noop(void *a, uint32_t b, uint32_t c) { (void)a; (void)b; (void)c; }
 static void *osi_sleep_ret_noop(int id) { (void)id; return NULL; }
 static int  osi_coex_flex_set(uint8_t v) { (void)v; return 0; }
+static uint8_t osi_coex_flex_get(void) { return 1; }
 
-// Exact ESP32-C6 wifi_osi_funcs_t layout (ESP-IDF v5.3.2, VERSION=8, MAGIC=0xDEADBEAF)
-#define CONFIG_IDF_TARGET_ESP32C6 1
-typedef struct wifi_osi_funcs_t {
-    int32_t _version;
-    bool (*_env_is_chip)(void);
-    void (*_set_intr)(int32_t, uint32_t, uint32_t, int32_t);
-    void (*_clear_intr)(uint32_t, uint32_t);
-    void (*_set_isr)(int32_t, void *, void *);
-    void (*_ints_on)(uint32_t);
-    void (*_ints_off)(uint32_t);
-    bool (*_is_from_isr)(void);
-    void *(*_spin_lock_create)(void);
-    void (*_spin_lock_delete)(void *);
-    uint32_t (*_wifi_int_disable)(void *);
-    void (*_wifi_int_restore)(void *, uint32_t);
-    void (*_task_yield_from_isr)(void);
-    void *(*_semphr_create)(uint32_t, uint32_t);
-    void (*_semphr_delete)(void *);
-    int32_t (*_semphr_take)(void *, uint32_t);
-    int32_t (*_semphr_give)(void *);
-    void *(*_wifi_thread_semphr_get)(void);
-    void *(*_mutex_create)(void);
-    void *(*_recursive_mutex_create)(void);
-    void (*_mutex_delete)(void *);
-    int32_t (*_mutex_lock)(void *);
-    int32_t (*_mutex_unlock)(void *);
-    void *(*_queue_create)(uint32_t, uint32_t);
-    void (*_queue_delete)(void *);
-    int32_t (*_queue_send)(void *, void *, uint32_t);
-    int32_t (*_queue_send_from_isr)(void *, void *, void *);
-    int32_t (*_queue_send_to_back)(void *, void *, uint32_t);
-    int32_t (*_queue_send_to_front)(void *, void *, uint32_t);
-    int32_t (*_queue_recv)(void *, void *, uint32_t);
-    uint32_t (*_queue_msg_waiting)(void *);
-    void *(*_event_group_create)(void);
-    void (*_event_group_delete)(void *);
-    uint32_t (*_event_group_set_bits)(void *, uint32_t);
-    uint32_t (*_event_group_clear_bits)(void *, uint32_t);
-    uint32_t (*_event_group_wait_bits)(void *, uint32_t, int, int, uint32_t);
-    int32_t (*_task_create_pinned_to_core)(void *, const char *, uint32_t, void *, uint32_t, void *, uint32_t);
-    int32_t (*_task_create)(void *, const char *, uint32_t, void *, uint32_t, void *);
-    void (*_task_delete)(void *);
-    void (*_task_delay)(uint32_t);
-    int32_t (*_task_ms_to_tick)(uint32_t);
-    void *(*_task_get_current_task)(void);
-    int32_t (*_task_get_max_priority)(void);
-    void *(*_malloc)(size_t);
-    void (*_free)(void *);
-    int32_t (*_event_post)(const char *, int32_t, void *, size_t, uint32_t);
-    uint32_t (*_get_free_heap_size)(void);
-    uint32_t (*_rand)(void);
-    void (*_dport_access_stall_other_cpu_start_wrap)(void);
-    void (*_dport_access_stall_other_cpu_end_wrap)(void);
-    void (*_wifi_apb80m_request)(void);
-    void (*_wifi_apb80m_release)(void);
-    void (*_phy_disable)(void);
-    void (*_phy_enable)(void);
-    int (*_phy_update_country_info)(const char *);
-    int (*_read_mac)(uint8_t *, unsigned int);
-    void (*_timer_arm)(void *, uint32_t, bool);
-    void (*_timer_disarm)(void *);
-    void (*_timer_done)(void *);
-    void (*_timer_setfn)(void *, void *, void *);
-    void (*_timer_arm_us)(void *, uint32_t, bool);
-    void (*_wifi_reset_mac)(void);
-    void (*_wifi_clock_enable)(void);
-    void (*_wifi_clock_disable)(void);
-    void (*_wifi_rtc_enable_iso)(void);
-    void (*_wifi_rtc_disable_iso)(void);
-    int64_t (*_esp_timer_get_time)(void);
-    int (*_nvs_set_i8)(uint32_t, const char *, int8_t);
-    int (*_nvs_get_i8)(uint32_t, const char *, int8_t *);
-    int (*_nvs_set_u8)(uint32_t, const char *, uint8_t);
-    int (*_nvs_get_u8)(uint32_t, const char *, uint8_t *);
-    int (*_nvs_set_u16)(uint32_t, const char *, uint16_t);
-    int (*_nvs_get_u16)(uint32_t, const char *, uint16_t *);
-    int (*_nvs_open)(const char *, unsigned int, uint32_t *);
-    void (*_nvs_close)(uint32_t);
-    int (*_nvs_commit)(uint32_t);
-    int (*_nvs_set_blob)(uint32_t, const char *, const void *, size_t);
-    int (*_nvs_get_blob)(uint32_t, const char *, void *, size_t *);
-    int (*_nvs_erase_key)(uint32_t, const char *);
-    int (*_get_random)(uint8_t *, size_t);
-    int (*_get_time)(void *);
-    unsigned long (*_random)(void);
-    uint32_t (*_slowclk_cal_get)(void);
-    void (*_log_write)(unsigned int, const char *, const char *, ...);
-    void (*_log_writev)(unsigned int, const char *, const char *, va_list);
-    uint32_t (*_log_timestamp)(void);
-    void *(*_malloc_internal)(size_t);
-    void *(*_realloc_internal)(void *, size_t);
-    void *(*_calloc_internal)(size_t, size_t);
-    void *(*_zalloc_internal)(size_t);
-    void *(*_wifi_malloc)(size_t);
-    void *(*_wifi_realloc)(void *, size_t);
-    void *(*_wifi_calloc)(size_t, size_t);
-    void *(*_wifi_zalloc)(size_t);
-    void *(*_wifi_create_queue)(int, int);
-    void (*_wifi_delete_queue)(void *);
-    int (*_coex_init)(void);
-    void (*_coex_deinit)(void);
-    int (*_coex_enable)(void);
-    void (*_coex_disable)(void);
-    uint32_t (*_coex_status_get)(void);
-    void (*_coex_condition_set)(uint32_t, bool);
-    int (*_coex_wifi_request)(uint32_t, uint32_t, uint32_t);
-    int (*_coex_wifi_release)(uint32_t);
-    int (*_coex_wifi_channel_set)(uint8_t, uint8_t);
-    int (*_coex_event_duration_get)(uint32_t, uint32_t *);
-    int (*_coex_pti_get)(uint32_t, uint8_t *);
-    void (*_coex_schm_status_bit_clear)(uint32_t, uint32_t);
-    void (*_coex_schm_status_bit_set)(uint32_t, uint32_t);
-    int (*_coex_schm_interval_set)(int);
-    uint32_t (*_coex_schm_interval_get)(void);
-    uint8_t (*_coex_schm_curr_period_get)(void);
-    void *(*_coex_schm_curr_phase_get)(void);
-    int (*_coex_schm_process_restart)(void);
-    int (*_coex_schm_register_cb)(int, int (*)(int));
-    int (*_coex_register_start_cb)(int (*)(void));
-    void (*_regdma_link_set_write_wait_content)(void *, uint32_t, uint32_t);
-    void *(*_sleep_retention_find_link_by_id)(int);
-    int (*_coex_schm_flexible_period_set)(uint8_t);
-    uint8_t (*_coex_schm_flexible_period_get)(void);
-    int32_t _magic;
-} wifi_osi_funcs_t;
+// Wrapper matching ESP-IDF wifi_static_queue_t (struct whose first member is the queue handle)
+typedef struct {
+    void *handle;
+} wifi_static_queue_compat_t;
 
 static void *osi_wifi_create_queue_int(int len, int sz) {
-    return osi_queue_create((uint32_t)len, (uint32_t)sz);
+    wifi_static_queue_compat_t *sq = (wifi_static_queue_compat_t *)wifi_heap_calloc(1, sizeof(wifi_static_queue_compat_t));
+    if (!sq) return NULL;
+    sq->handle = osi_queue_create((uint32_t)len, (uint32_t)sz);
+    if (!sq->handle) {
+        wifi_heap_free(sq);
+        return NULL;
+    }
+    return sq;
+}
+
+static void osi_wifi_delete_queue_wrap(void *q) {
+    wifi_static_queue_compat_t *sq = (wifi_static_queue_compat_t *)q;
+    if (sq) {
+        osi_queue_delete(sq->handle);
+        wifi_heap_free(sq);
+    }
 }
 
 wifi_osi_funcs_t g_wifi_osi_funcs = {
-    ._version                                 = 0x00000008,
+    ._version                                 = ESP_WIFI_OS_ADAPTER_VERSION,
     ._env_is_chip                             = osi_env_is_chip,
     ._set_intr                                = osi_set_intr,
     ._clear_intr                              = osi_clear_intr,
@@ -712,8 +846,8 @@ wifi_osi_funcs_t g_wifi_osi_funcs = {
     ._dport_access_stall_other_cpu_end_wrap   = osi_noop,
     ._wifi_apb80m_request                     = osi_noop,
     ._wifi_apb80m_release                     = osi_noop,
-    ._phy_disable                             = osi_noop,
-    ._phy_enable                              = osi_wifi_clock_enable,
+    ._phy_disable                             = osi_phy_disable,
+    ._phy_enable                              = osi_phy_enable,
     ._phy_update_country_info                 = osi_phy_country,
     ._read_mac                                = osi_read_mac,
     ._timer_arm                               = osi_timer_arm,
@@ -755,129 +889,152 @@ wifi_osi_funcs_t g_wifi_osi_funcs = {
     ._wifi_calloc                             = wifi_heap_calloc,
     ._wifi_zalloc                             = osi_zalloc,
     ._wifi_create_queue                       = osi_wifi_create_queue_int,
-    ._wifi_delete_queue                       = osi_queue_delete,
-    ._coex_init                               = osi_ok_int,
-    ._coex_deinit                             = osi_noop,
-    ._coex_enable                             = osi_ok_int,
-    ._coex_disable                            = osi_noop,
+    ._wifi_delete_queue                       = osi_wifi_delete_queue_wrap,
+    ._coex_init                               = coex_init,
+    ._coex_deinit                             = coex_deinit,
+    ._coex_enable                             = coex_enable,
+    ._coex_disable                            = coex_disable,
     ._coex_status_get                         = osi_coex_status,
     ._coex_condition_set                      = osi_coex_cond,
-    ._coex_wifi_request                       = osi_coex_req,
-    ._coex_wifi_release                       = osi_coex_rel,
+    ._coex_wifi_request                       = coex_wifi_request,
+    ._coex_wifi_release                       = coex_wifi_release,
     ._coex_wifi_channel_set                   = osi_coex_ch,
-    ._coex_event_duration_get                 = osi_coex_dur,
-    ._coex_pti_get                            = osi_coex_pti,
+    ._coex_event_duration_get                 = coex_event_duration_get,
+    ._coex_pti_get                            = coex_pti_get,
     ._coex_schm_status_bit_clear              = osi_coex_schm_u32,
     ._coex_schm_status_bit_set                = osi_coex_schm_u32,
     ._coex_schm_interval_set                  = osi_coex_schm_int,
     ._coex_schm_interval_get                  = osi_coex_schm_get32,
     ._coex_schm_curr_period_get               = osi_coex_schm_get8,
     ._coex_schm_curr_phase_get                = osi_coex_schm_ptr,
-    ._coex_schm_process_restart               = osi_ok_int,
+    ._coex_schm_process_restart               = osi_coex_ok_void,
     ._coex_schm_register_cb                   = osi_coex_schm_cb,
-    ._coex_register_start_cb                  = osi_coex_start_cb,
+    ._coex_register_start_cb                  = coex_register_start_cb,
     ._regdma_link_set_write_wait_content      = osi_regdma_noop,
     ._sleep_retention_find_link_by_id         = osi_sleep_ret_noop,
     ._coex_schm_flexible_period_set           = osi_coex_flex_set,
-    ._coex_schm_flexible_period_get           = osi_coex_schm_get8,
-    ._magic                                   = (int32_t)0xDEADBEAF,
+    ._coex_schm_flexible_period_get           = osi_coex_flex_get,
+    ._magic                                   = (int32_t)ESP_WIFI_OS_ADAPTER_MAGIC,
 };
 
 // ---------------------------------------------------------------------------
 // High-Level C Bridge to Espressif libnet80211.a (called from bsp/esp32c6/wifi.zc)
 // ---------------------------------------------------------------------------
-typedef struct {
-    uint32_t size;
-    uint32_t version;
-    void    *funcs[27];
-} wpa_crypto_funcs_compat_t;
-
-typedef struct {
-    wifi_osi_funcs_t         *osi_funcs;
-    wpa_crypto_funcs_compat_t wpa_crypto_funcs;
-    int                       static_rx_buf_num;
-    int                       dynamic_rx_buf_num;
-    int                       tx_buf_type;
-    int                       static_tx_buf_num;
-    int                       dynamic_tx_buf_num;
-    int                       rx_mgmt_buf_type;
-    int                       rx_mgmt_buf_num;
-    int                       cache_tx_buf_num;
-    int                       csi_enable;
-    int                       ampdu_rx_enable;
-    int                       ampdu_tx_enable;
-    int                       amsdu_tx_enable;
-    int                       nvs_enable;
-    int                       nano_enable;
-    int                       rx_ba_win;
-    int                       wifi_task_core_id;
-    int                       beacon_max_len;
-    int                       mgmt_sbuf_num;
-    uint64_t                  feature_caps;
-    bool                      sta_disconnected_pm;
-    int                       espnow_max_encrypt_num;
-    int                       tx_hetb_queue_num;
-    bool                      dump_hesigb_enable;
-    int                       magic;
-} wifi_init_config_compat_t;
-
-extern int32_t esp_wifi_init_internal(const wifi_init_config_compat_t *cfg);
-extern int32_t esp_wifi_set_mode(int32_t mode);
-extern int32_t esp_wifi_start(void);
-extern int32_t esp_wifi_scan_start(const void *cfg, bool block);
-extern int32_t esp_wifi_scan_get_ap_num(uint16_t *number);
-extern int32_t esp_wifi_connect_internal(void);
-extern int32_t esp_wifi_disconnect_internal(void);
+extern esp_err_t esp_wifi_init_internal(const wifi_init_config_t *config);
+extern esp_err_t esp_wifi_internal_set_log_level(int level);
+extern esp_err_t esp_wifi_connect_internal(void);
+extern esp_err_t esp_wifi_disconnect_internal(void);
 
 static char g_wifi_ssid[33];
+
+static const char *auth_mode_str(wifi_auth_mode_t m) {
+    switch (m) {
+        case WIFI_AUTH_OPEN:            return "OPEN    ";
+        case WIFI_AUTH_WEP:             return "WEP     ";
+        case WIFI_AUTH_WPA_PSK:         return "WPA-PSK ";
+        case WIFI_AUTH_WPA2_PSK:        return "WPA2-PSK";
+        case WIFI_AUTH_WPA_WPA2_PSK:    return "WPA/WPA2";
+        case WIFI_AUTH_WPA3_PSK:        return "WPA3-SAE";
+        case WIFI_AUTH_WPA2_WPA3_PSK:   return "WPA2/3  ";
+        default:                        return "OTHER   ";
+    }
+}
 
 int32_t wifi_drv_init(void) {
     if (g_wifi_state != 0) return 0;
     osi_wifi_clock_enable();
-    wifi_init_config_compat_t cfg;
-    memset(&cfg, 0, sizeof(cfg));
-    cfg.osi_funcs          = &g_wifi_osi_funcs;
-    cfg.wpa_crypto_funcs.size = sizeof(wpa_crypto_funcs_compat_t);
-    cfg.wpa_crypto_funcs.version = 1;
-    cfg.static_rx_buf_num  = 6;
-    cfg.dynamic_rx_buf_num = 16;
-    cfg.tx_buf_type        = 1;
-    cfg.dynamic_tx_buf_num = 16;
-    cfg.rx_mgmt_buf_num    = 5;
-    cfg.ampdu_rx_enable    = 1;
-    cfg.ampdu_tx_enable    = 1;
-    cfg.rx_ba_win          = 6;
-    cfg.beacon_max_len     = 752;
-    cfg.mgmt_sbuf_num      = 6;
-    cfg.magic              = 0x1F2F3F4F;
+    (void)esp_coex_adapter_register(&g_coex_adapter_funcs);
+    (void)coex_pre_init();
 
+    wifi_init_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.osi_funcs              = &g_wifi_osi_funcs;
+    cfg.wpa_crypto_funcs.size  = sizeof(wpa_crypto_funcs_t);
+    cfg.wpa_crypto_funcs.version = 1;
+    cfg.static_rx_buf_num      = 6;
+    cfg.dynamic_rx_buf_num     = 16;
+    cfg.tx_buf_type            = 1;
+    cfg.dynamic_tx_buf_num     = 16;
+    cfg.rx_mgmt_buf_num        = 5;
+    cfg.ampdu_rx_enable        = 1;
+    cfg.ampdu_tx_enable        = 1;
+    cfg.rx_ba_win              = 6;
+    cfg.beacon_max_len         = 752;
+    cfg.mgmt_sbuf_num          = 32;
+    cfg.tx_hetb_queue_num      = 1;
+    cfg.magic                  = WIFI_INIT_CONFIG_MAGIC;
+
+    esp_wifi_internal_set_log_level(2); // WIFI_LOG_WARN
     int32_t err = esp_wifi_init_internal(&cfg);
     if (err != 0) return err;
-    err = esp_wifi_set_mode(1); // WIFI_MODE_STA = 1
+    err = esp_wifi_set_mode(WIFI_MODE_STA);
     if (err != 0) return err;
     err = esp_wifi_start();
-    if (err == 0) g_wifi_state = 1;
+    if (err == 0) {
+        esp_wifi_set_ps(WIFI_PS_NONE);
+        g_wifi_state = 1;
+        rtos_delay(50); // Allow async STA_START to settle in wifi task
+    }
     return err;
 }
 
-int32_t wifi_drv_scan(uint16_t *out_count) {
+int32_t wifi_drv_scan_and_print(uint16_t *out_count) {
     int32_t err = wifi_drv_init();
     if (err != 0) return err;
     g_wifi_state = 2;
     err = esp_wifi_scan_start(NULL, true);
-    if (err == 0 && out_count) {
-        esp_wifi_scan_get_ap_num(out_count);
-    }
     g_wifi_state = 1;
-    return err;
+    if (err != 0) return err;
+
+    uint16_t total = 0;
+    (void)esp_wifi_scan_get_ap_num(&total);
+    if (out_count) *out_count = total;
+    if (total == 0) return 0;
+
+    uint16_t fetch = (total > 16U) ? 16U : total;
+    wifi_ap_record_t *aps = (wifi_ap_record_t *)wifi_heap_calloc(fetch, sizeof(wifi_ap_record_t));
+    if (!aps) return 0;
+
+    if (esp_wifi_scan_get_ap_records(&fetch, aps) == 0) {
+        bsp_uart_puts("  Ch  RSSI   Auth      BSSID              SSID\n");
+        bsp_uart_puts("  --  -----  --------  -----------------  ------------------------\n");
+        for (uint16_t i = 0; i < fetch; i++) {
+            char line[112];
+            snprintf(line, sizeof(line), "  %u   %d dBm %s  %X:%X:%X:%X:%X:%X  %s\n",
+                     (unsigned)aps[i].primary,
+                     (int)aps[i].rssi,
+                     auth_mode_str(aps[i].authmode),
+                     aps[i].bssid[0], aps[i].bssid[1], aps[i].bssid[2],
+                     aps[i].bssid[3], aps[i].bssid[4], aps[i].bssid[5],
+                     (const char *)aps[i].ssid);
+            bsp_uart_puts(line);
+        }
+    }
+    wifi_heap_free(aps);
+    return 0;
 }
 
 int32_t wifi_drv_connect(const char *ssid, const char *pass) {
-    (void)pass;
     int32_t err = wifi_drv_init();
     if (err != 0) return err;
-    strncpy(g_wifi_ssid, ssid ? ssid : "", 32);
-    g_wifi_ssid[32] = '\0';
+
+    wifi_config_t wcfg;
+    memset(&wcfg, 0, sizeof(wcfg));
+    if (ssid) {
+        strncpy((char *)wcfg.sta.ssid, ssid, sizeof(wcfg.sta.ssid) - 1);
+        strncpy(g_wifi_ssid, ssid, sizeof(g_wifi_ssid) - 1);
+        g_wifi_ssid[32] = '\0';
+    }
+    if (pass && pass[0] != '\0') {
+        strncpy((char *)wcfg.sta.password, pass, sizeof(wcfg.sta.password) - 1);
+        wcfg.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
+    } else {
+        wcfg.sta.threshold.authmode = WIFI_AUTH_OPEN;
+    }
+
+    err = esp_wifi_set_config(WIFI_IF_STA, &wcfg);
+    if (err != 0) return err;
+
     g_wifi_state = 3;
     return esp_wifi_connect_internal();
 }
@@ -892,43 +1049,10 @@ int32_t wifi_drv_get_state(void) { return g_wifi_state; }
 const char *wifi_drv_get_ssid(void) { return g_wifi_ssid; }
 uint32_t wifi_drv_free_heap(void) { return wifi_heap_free_bytes(); }
 
-// ---------------------------------------------------------------------------
-// ESP-IDF / Blob Auxiliary Globals & Calibration Constants
-// ---------------------------------------------------------------------------
 const char *const WIFI_EVENT = "WIFI_EVENT";
+uint8_t  g_espnow_user_oui[3] = { 0x18, 0xFE, 0x34 };
+uint32_t mesh_sta_auth_expire_time = 0;
 
 int rtc_clk_xtal_freq_get(void) {
     return 40; // ESP32-C6 40 MHz main crystal
 }
-
-uint32_t Basic11BGSched_ptr = 0;
-uint8_t  g_espnow_user_oui[3] = { 0x18, 0xFE, 0x34 };
-uint32_t mesh_sta_auth_expire_time = 0;
-const uint8_t regdomain_table[16] = { 0 };
-const uint8_t regulatory_data[64] = { 0 };
-
-// FTM (Fine Timing Measurement) PHY compensation constants (unused in STA Phase 1)
-const int16_t est_PHY_INIT_FTM_COMP_20_20D_MHZ     = 0;
-const int16_t est_PHY_INIT_FTM_COMP_20_20D_MHZ_DIS = 0;
-const int16_t est_PHY_INIT_FTM_COMP_20_20U_MHZ     = 0;
-const int16_t est_PHY_INIT_FTM_COMP_20_20U_MHZ_DIS = 0;
-const int16_t est_PHY_INIT_FTM_COMP_20_40D_MHZ     = 0;
-const int16_t est_PHY_INIT_FTM_COMP_20_40D_MHZ_DIS = 0;
-const int16_t est_PHY_INIT_FTM_COMP_20_40U_MHZ     = 0;
-const int16_t est_PHY_INIT_FTM_COMP_20_40U_MHZ_DIS = 0;
-const int16_t est_PHY_INIT_FTM_COMP_40_40D_MHZ     = 0;
-const int16_t est_PHY_INIT_FTM_COMP_40_40D_MHZ_DIS = 0;
-const int16_t est_PHY_INIT_FTM_COMP_40_40U_MHZ     = 0;
-const int16_t est_PHY_INIT_FTM_COMP_40_40U_MHZ_DIS = 0;
-const int16_t est_PHY_RESP_FTM_COMP_20_20D_MHZ     = 0;
-const int16_t est_PHY_RESP_FTM_COMP_20_20D_MHZ_DIS = 0;
-const int16_t est_PHY_RESP_FTM_COMP_20_20U_MHZ     = 0;
-const int16_t est_PHY_RESP_FTM_COMP_20_20U_MHZ_DIS = 0;
-const int16_t est_PHY_RESP_FTM_COMP_20_40D_MHZ     = 0;
-const int16_t est_PHY_RESP_FTM_COMP_20_40D_MHZ_DIS = 0;
-const int16_t est_PHY_RESP_FTM_COMP_20_40U_MHZ     = 0;
-const int16_t est_PHY_RESP_FTM_COMP_20_40U_MHZ_DIS = 0;
-const int16_t est_PHY_RESP_FTM_COMP_40_40D_MHZ     = 0;
-const int16_t est_PHY_RESP_FTM_COMP_40_40D_MHZ_DIS = 0;
-const int16_t est_PHY_RESP_FTM_COMP_40_40U_MHZ     = 0;
-const int16_t est_PHY_RESP_FTM_COMP_40_40U_MHZ_DIS = 0;

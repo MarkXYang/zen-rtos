@@ -227,7 +227,7 @@ def main():
         erase_size = ((len(flash_image) + 4095) // 4096) * 4096
         print(f"[esp32c6] Erasing & programming {len(flash_image)} bytes ({num_blocks} blocks) to SPI Flash @ 0x00000000...")
         flash_begin = struct.pack("<IIIII", erase_size, num_blocks, BLOCK_SIZE, 0x00000000, 0)
-        if not send_cmd(ser, ESP_FLASH_BEGIN, flash_begin, 0, timeout=5.0):
+        if not send_cmd(ser, ESP_FLASH_BEGIN, flash_begin, 0, timeout=15.0):
             print("[esp32c6] ERROR: FLASH_BEGIN rejected")
             sys.exit(1)
 

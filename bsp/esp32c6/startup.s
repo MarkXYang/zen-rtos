@@ -39,6 +39,8 @@ _start:
     addi  t2, t2, 4
     j     1b
 2:
+    fence.i
+
     /* 5. Point mtvec to our 256-byte-aligned RISC-V Vectored Trap Table (mode = 1) */
     la    t0, _mtvec_table
     ori   t0, t0, 1

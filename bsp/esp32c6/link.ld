@@ -17,7 +17,9 @@ SECTIONS
         KEEP(*(.direct_boot_header)) /* 0x40800000: 8-byte magic 0xAEDB041D, 0xAEDB041D */
         KEEP(*(.init))              /* 0x40800008: _start entry point at offset +0x08 */
         . = ALIGN(256);
-        KEEP(*(.mtvec_table))       /* 0x408001000: 256-byte aligned RISC-V trap table */
+        KEEP(*(.mtvec_table))       /* 0x40800100: 256-byte aligned RISC-V trap table */
+        *(.iram1)
+        *(.iram1.*)
         *(.text)
         *(.text*)
         *(.rodata)
@@ -35,9 +37,13 @@ SECTIONS
         *(.data*)
         *(.sdata)
         *(.sdata*)
+        *(.got)
+        *(.got.*)
         . = ALIGN(4);
         _edata = .;
     } > SRAM
+
+    PROVIDE(__global_pointer$ = _sdata + 0x800);
 
     .bss :
     {

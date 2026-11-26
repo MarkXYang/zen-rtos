@@ -95,9 +95,47 @@ static void rtos_update_ready_bit(uint32_t prio) {
     g_ready_bitmap &= ~(1UL << prio);
 }
 
-// Idle task stack & TCB
-#define IDLE_STACK_SIZE 128
+// Idle & Timer service task stacks
+#define IDLE_STACK_SIZE  128
+#define TIMER_STACK_SIZE 512
 static uint32_t              g_idle_stack[IDLE_STACK_SIZE];
+static rtos_sem_t            g_timer_sem;
+#ifndef RTOS_HOST_TEST
+static uint32_t              g_timer_stack[TIMER_STACK_SIZE];
+#endif
+
+static void rtos_service_expired_timers(void) {
+    while (1) {
+        uint32_t flags = rtos_irq_save();
+        rtos_timer_cb_t due_cb = NULL;
+        void *due_arg = NULL;
+        for (rtos_timer_t *tmr = g_timer_list; tmr != NULL; tmr = tmr->next) {
+            if (tmr->active && (int32_t)(g_system_ticks - tmr->expire_tick) >= 0) {
+                due_cb = tmr->callback;
+                due_arg = tmr->arg;
+                if (tmr->periodic && tmr->period_ticks > 0) {
+                    tmr->expire_tick = g_system_ticks + tmr->period_ticks;
+                } else {
+                    tmr->active = false;
+                }
+                break;
+            }
+        }
+        rtos_irq_restore(flags);
+        if (!due_cb) break;
+        due_cb(due_arg);
+    }
+}
+
+#ifndef RTOS_HOST_TEST
+static void rtos_timer_task(void *arg) {
+    (void)arg;
+    while (1) {
+        rtos_sem_wait(&g_timer_sem, RTOS_WAIT_FOREVER);
+        rtos_service_expired_timers();
+    }
+}
+#endif
 
 static void rtos_trace_record(rtos_trace_type_t type, uint8_t task_id, uint16_t arg1, uint32_t arg2) {
     uint32_t idx = g_trace_head;
@@ -171,7 +209,12 @@ void rtos_init(void) {
     }
 
     // Create Idle Task at lowest priority (31) -> Task ID 1
+    rtos_sem_init(&g_timer_sem, 0, 1);
     rtos_task_create(rtos_idle_task, NULL, 31, g_idle_stack, IDLE_STACK_SIZE, "Idle");
+#ifndef RTOS_HOST_TEST
+    // High-priority thread-mode software timer daemon (avoids running callbacks in ISR)
+    rtos_task_create(rtos_timer_task, NULL, 1, g_timer_stack, TIMER_STACK_SIZE, "SysTimer");
+#endif
 }
 
 tcb_t *rtos_task_create_ex(rtos_task_func_t func, void *arg, uint32_t priority,
@@ -360,22 +403,18 @@ void SysTick_Handler(void) {
         }
     }
 
-    // Service expired software timers
-    rtos_timer_t *tmr = g_timer_list;
-    while (tmr != NULL) {
-        rtos_timer_t *next = tmr->next;
+    // Check for expired software timers: wake SysTimer thread on hardware, run inline in host sim
+#ifdef RTOS_HOST_TEST
+    rtos_service_expired_timers();
+#else
+    for (rtos_timer_t *tmr = g_timer_list; tmr != NULL; tmr = tmr->next) {
         if (tmr->active && (int32_t)(g_system_ticks - tmr->expire_tick) >= 0) {
-            if (tmr->periodic && tmr->period_ticks > 0) {
-                tmr->expire_tick = g_system_ticks + tmr->period_ticks;
-            } else {
-                tmr->active = false;
-            }
-            if (tmr->callback) {
-                tmr->callback(tmr->arg);
-            }
+            bool woken = false;
+            rtos_sem_signal_from_isr(&g_timer_sem, &woken);
+            break;
         }
-        tmr = next;
     }
+#endif
 
     rtos_schedule();
 }
@@ -532,7 +571,8 @@ void rtos_sem_signal_from_isr(rtos_sem_t *sem, bool *higher_prio_woken) {
         woken->sleep_ticks = 0;
         g_ready_bitmap |= (1UL << woken->current_priority);
         rtos_trace_record(TRACE_SEM_SIGNAL, (uint8_t)woken->id, 1, 0);
-        if (current_tcb && woken->current_priority < current_tcb->current_priority) {
+        const volatile tcb_t *ref = next_tcb ? next_tcb : current_tcb;
+        if (ref && woken->current_priority < ref->current_priority) {
             if (higher_prio_woken) *higher_prio_woken = true;
             next_tcb = woken;
         }

@@ -26,7 +26,7 @@ LDFLAGS_ARM   ?= --target=$(TARGET_TRIPLE) -mcpu=$(CPU) -mthumb \
                  -Wl,--gc-sections
 
 # ESP32-C6-Pico Target Flags (Clang bare-metal RISC-V RV32IMAC)
-CFLAGS_ESP32C6  ?= --target=riscv32-unknown-elf -march=rv32imac -mabi=ilp32 \
+CFLAGS_ESP32C6  ?= --target=riscv32-unknown-elf -march=rv32imac_zicsr_zifencei -mabi=ilp32 \
                    -mcmodel=medany -O2 -Wall -Wextra -ffreestanding \
                    -Wno-unused-parameter -Wno-unused-variable -Wno-unused-function \
                    -Wno-parentheses-equality \
@@ -34,7 +34,7 @@ CFLAGS_ESP32C6  ?= --target=riscv32-unknown-elf -march=rv32imac -mabi=ilp32 \
                    -Ikernel/include -Ibsp/esp32c6 -Iarch/riscv/rv32 \
                    -fdata-sections -ffunction-sections
 
-LDFLAGS_ESP32C6 ?= --target=riscv32-unknown-elf -march=rv32imac -mabi=ilp32 \
+LDFLAGS_ESP32C6 ?= --target=riscv32-unknown-elf -march=rv32imac_zicsr_zifencei -mabi=ilp32 \
                    -nostdlib -fuse-ld=lld \
                    -Wl,-T,bsp/esp32c6/link.ld \
                    -Wl,--gc-sections
@@ -46,7 +46,7 @@ CFLAGS_ESP32C6_WIFI ?= --target=riscv32-unknown-elf -march=rv32imac_zicsr_zifenc
                        -Wno-unused-parameter -Wno-unused-variable -Wno-unused-function \
                        -Wno-parentheses-equality \
                        -DRTOS_ARCH_RISCV -DZC_FUNC= -DZC_GLOBAL= \
-                       -Ikernel/include -Ibsp/esp32c6 -Iarch/riscv/rv32 \
+                       -Ikernel/include -Ibsp/esp32c6 -I$(ESP32C6_WIFI_DIR)/include -Iarch/riscv/rv32 \
                        -fdata-sections -ffunction-sections
 
 LDFLAGS_ESP32C6_WIFI ?= --target=riscv32-unknown-elf -march=rv32imac_zicsr_zifencei -mabi=ilp32 \
@@ -185,14 +185,15 @@ $(BUILD_DIR)/zen_rtos_esp32c6_wifi.elf: kernel/rtos.c \
                                         bsp/esp32c6/wifi_heap.c \
                                         bsp/esp32c6/wifi_libc.c \
                                         bsp/esp32c6/wifi_osi.c \
+                                        bsp/esp32c6/link_wifi.ld \
                                         $(BUILD_DIR)/esp32c6_zc.c \
                                         $(BUILD_DIR)/esp32c6_wifi_zc.c \
                                         app/main_zc.c
-	@if [ ! -f "$(ESP32C6_WIFI_DIR)/lib/libnet80211.a" ]; then \
+	@if [ ! -f "$(ESP32C6_WIFI_DIR)/lib/libnet80211.a" ] || [ ! -f "$(ESP32C6_WIFI_DIR)/include/phy_init_data.c" ]; then \
 		./scripts/fetch_esp32c6_wifi_blobs.sh; \
 	fi
 	@mkdir -p $(BUILD_DIR)
-	$(CLANG) $(CFLAGS_ESP32C6_WIFI) $(LDFLAGS_ESP32C6_WIFI) $^ $(ESP32C6_WIFI_LIBS) -o $@
+	$(CLANG) $(CFLAGS_ESP32C6_WIFI) $(LDFLAGS_ESP32C6_WIFI) $(filter-out %.ld,$^) $(ESP32C6_WIFI_DIR)/include/phy_init_data.c $(ESP32C6_WIFI_LIBS) -o $@
 
 $(BUILD_DIR)/zen_rtos_esp32c6_wifi.bin: $(BUILD_DIR)/zen_rtos_esp32c6_wifi.elf
 	$(LLVM_OBJCOPY) -O binary $< $@

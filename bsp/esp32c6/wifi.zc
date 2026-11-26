@@ -7,7 +7,7 @@ extern fn bsp_uart_putdec(val: u32);
 
 extern fn wifi_drv_read_mac(mac_out: u8*);
 extern fn wifi_drv_init() -> i32;
-extern fn wifi_drv_scan(out_count: u16*) -> i32;
+extern fn wifi_drv_scan_and_print(out_count: u16*) -> i32;
 extern fn wifi_drv_connect(ssid: char*, pass: char*) -> i32;
 extern fn wifi_drv_disconnect() -> i32;
 extern fn wifi_drv_get_state() -> i32;
@@ -102,13 +102,13 @@ fn bsp_wifi_shell_cmd(cmd: char*) -> bool {
     } else if wifi_starts_with(cmd, "wifi scan") {
         bsp_uart_puts("Starting 2.4 GHz Wi-Fi AP scan...\n");
         let ap_num: u16 = 0;
-        let err: i32 = wifi_drv_scan(&ap_num);
+        let err: i32 = wifi_drv_scan_and_print(&ap_num);
         if err != 0 {
             bsp_uart_puts("Wi-Fi scan error: ");
             bsp_uart_putdec((u32)err);
             bsp_uart_puts("\n");
         } else {
-            bsp_uart_puts("Scan complete. Access points found: ");
+            bsp_uart_puts("Scan complete. Total access points found: ");
             bsp_uart_putdec((u32)ap_num);
             bsp_uart_puts("\n");
         }
