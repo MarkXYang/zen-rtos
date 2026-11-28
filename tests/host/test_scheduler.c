@@ -6,6 +6,7 @@
 #include "wifi_wpa2.h"
 #include "zen_net.h"
 #include "zen_net_utils.h"
+#include "zen_tcp.h"
 
 void bsp_uart_puts(const char *s) { (void)s; }
 
@@ -696,6 +697,123 @@ static void test_zen_net_utils_dns_and_sntp(void) {
     printf("          DNS RFC 1035, SNTP UTC leap-year formatter & UDP syslog verified. [PASS]\n");
 }
 
+// -------------------------------------------------------------------------
+// Test 17: ZenTCP Phase 4 (3-Way Handshake, Send/ACK, Recv, FIN EOF)
+// -------------------------------------------------------------------------
+static uint16_t tcp_test_csum(uint32_t src_ip, uint32_t dst_ip, const uint8_t *seg, size_t len) {
+    uint32_t sum = ((src_ip >> 16) & 0xFFFFU) + (src_ip & 0xFFFFU) +
+                   ((dst_ip >> 16) & 0xFFFFU) + (dst_ip & 0xFFFFU) + 6U + (uint32_t)len;
+    for (size_t i = 0; i + 1 < len; i += 2) {
+        sum += ((uint32_t)seg[i] << 8) | seg[i + 1];
+    }
+    if (len & 1U) sum += (uint32_t)seg[len - 1] << 8;
+    while (sum >> 16) sum = (sum & 0xFFFFU) + (sum >> 16);
+    return (uint16_t)(~sum & 0xFFFFU);
+}
+
+static void inject_mock_tcp(const uint8_t src_mac[6], const uint8_t dst_mac[6],
+                            uint32_t src_ip, uint32_t dst_ip,
+                            uint16_t src_port, uint16_t dst_port,
+                            uint32_t seq, uint32_t ack, uint8_t flags,
+                            const uint8_t *data, uint16_t dlen) {
+    uint8_t frame[256];
+    uint16_t tcp_len = (uint16_t)(20 + dlen);
+    uint16_t ip_len  = (uint16_t)(20 + tcp_len);
+    memset(frame, 0, 14 + ip_len);
+    memcpy(frame + 0, dst_mac, 6);
+    memcpy(frame + 6, src_mac, 6);
+    frame[12] = 0x08; frame[13] = 0x00;
+
+    uint8_t *ip = frame + 14;
+    ip[0] = 0x45; ip[2] = (uint8_t)(ip_len >> 8); ip[3] = (uint8_t)(ip_len);
+    ip[8] = 64; ip[9] = 6;
+    ip[12] = (uint8_t)(src_ip >> 24); ip[13] = (uint8_t)(src_ip >> 16);
+    ip[14] = (uint8_t)(src_ip >> 8);  ip[15] = (uint8_t)(src_ip);
+    ip[16] = (uint8_t)(dst_ip >> 24); ip[17] = (uint8_t)(dst_ip >> 16);
+    ip[18] = (uint8_t)(dst_ip >> 8);  ip[19] = (uint8_t)(dst_ip);
+    uint16_t ipcs = zen_inet_checksum(ip, 20);
+    ip[10] = (uint8_t)(ipcs >> 8); ip[11] = (uint8_t)(ipcs);
+
+    uint8_t *tcp = ip + 20;
+    tcp[0] = (uint8_t)(src_port >> 8); tcp[1] = (uint8_t)(src_port);
+    tcp[2] = (uint8_t)(dst_port >> 8); tcp[3] = (uint8_t)(dst_port);
+    tcp[4] = (uint8_t)(seq >> 24); tcp[5] = (uint8_t)(seq >> 16);
+    tcp[6] = (uint8_t)(seq >> 8);  tcp[7] = (uint8_t)(seq);
+    tcp[8] = (uint8_t)(ack >> 24); tcp[9] = (uint8_t)(ack >> 16);
+    tcp[10] = (uint8_t)(ack >> 8); tcp[11] = (uint8_t)(ack);
+    tcp[12] = 0x50; // 20B header
+    tcp[13] = flags;
+    tcp[14] = 0x10; tcp[15] = 0x00; // Window 4096
+    if (dlen > 0 && data) memcpy(tcp + 20, data, dlen);
+    uint16_t tcs = tcp_test_csum(src_ip, dst_ip, tcp, tcp_len);
+    tcp[16] = (uint8_t)(tcs >> 8); tcp[17] = (uint8_t)(tcs);
+
+    zen_net_rx_frame(frame, (uint16_t)(14 + ip_len));
+}
+
+// Loopback TX interceptor that simulates a remote HTTP/TCP server on 192.168.1.1:80
+static int32_t mock_tcp_server_tx(const uint8_t *frame, uint16_t len) {
+    mock_eth_tx(frame, len);
+    if (len < 14 + 20 + 20 || frame[12] != 0x08 || frame[13] != 0x00 || frame[23] != 6) {
+        return 0;
+    }
+    const uint8_t *tcp = frame + 34;
+    uint16_t cli_port = (uint16_t)((tcp[0] << 8) | tcp[1]);
+    uint16_t srv_port = (uint16_t)((tcp[2] << 8) | tcp[3]);
+    uint32_t cli_seq  = ((uint32_t)tcp[4] << 24) | ((uint32_t)tcp[5] << 16) |
+                        ((uint32_t)tcp[6] << 8)  | tcp[7];
+    uint8_t  flags    = tcp[13];
+    size_t   hdr_len  = (size_t)((tcp[12] >> 4) & 0x0FU) * 4U;
+    size_t   ip_len   = (size_t)((frame[16] << 8) | frame[17]);
+    size_t   dlen     = (ip_len > 20U + hdr_len) ? (ip_len - 20U - hdr_len) : 0U;
+
+    static const uint8_t sta_mac[6] = { 0x40, 0x4C, 0xCA, 0x53, 0xA2, 0xA4 };
+    static const uint8_t gw_mac[6]  = { 0x10, 0x6F, 0x3F, 0x64, 0xDC, 0xC2 };
+
+    if ((flags & 0x02U) && !(flags & 0x10U)) {
+        // SYN -> reply SYN+ACK (server ISN = 0x50000000)
+        inject_mock_tcp(gw_mac, sta_mac, 0xC0A80101U, 0xC0A8018EU,
+                        srv_port, cli_port, 0x50000000U, cli_seq + 1U, 0x12U, NULL, 0);
+    } else if (dlen > 0) {
+        // Data PSH+ACK -> ACK client data, then send HTTP 200 OK + FIN
+        const char *resp = "HTTP/1.1 200 OK\r\n\r\nZenTCP";
+        inject_mock_tcp(gw_mac, sta_mac, 0xC0A80101U, 0xC0A8018EU,
+                        srv_port, cli_port, 0x50000001U, cli_seq + (uint32_t)dlen,
+                        0x19U, (const uint8_t *)resp, (uint16_t)strlen(resp));
+    }
+    return 0;
+}
+
+static void test_zen_tcp_and_http(void) {
+    printf("[TEST 17] Verifying ZenTCP 3-way handshake, data transfer, FIN & HTTP GET...\n");
+    static const uint8_t sta_mac[6] = { 0x40, 0x4C, 0xCA, 0x53, 0xA2, 0xA4 };
+    static const uint8_t gw_mac[6]  = { 0x10, 0x6F, 0x3F, 0x64, 0xDC, 0xC2 };
+
+    zen_net_init(sta_mac, (void *)mock_tcp_server_tx);
+    zen_net_set_static(0xC0A8018EU, 0xFFFFFF00U, 0xC0A80101U, 0xC0A80101U);
+    zen_net_set_link(true);
+
+    // Seed ARP cache for 192.168.1.1 via gratuitous ARP reply
+    uint8_t arp_rep[42];
+    memset(arp_rep, 0, sizeof(arp_rep));
+    memcpy(arp_rep + 0, sta_mac, 6);
+    memcpy(arp_rep + 6, gw_mac, 6);
+    arp_rep[12] = 0x08; arp_rep[13] = 0x06;
+    arp_rep[15] = 1; arp_rep[16] = 0x08; arp_rep[18] = 6; arp_rep[19] = 4; arp_rep[21] = 2;
+    memcpy(arp_rep + 22, gw_mac, 6);
+    arp_rep[28] = 192; arp_rep[29] = 168; arp_rep[30] = 1; arp_rep[31] = 1;
+    zen_net_rx_frame(arp_rep, sizeof(arp_rep));
+
+    // Full HTTP/1.1 GET over ZenTCP against mock loopback server
+    uint8_t http_out[128];
+    int32_t n = zen_http_get("192.168.1.1", 80, "/", http_out, sizeof(http_out), 100);
+    assert(n == (int32_t)strlen("HTTP/1.1 200 OK\r\n\r\nZenTCP"));
+    assert(strcmp((char *)http_out, "HTTP/1.1 200 OK\r\n\r\nZenTCP") == 0);
+    assert(zen_tcp_slot_state(0) == ZEN_TCP_CLOSED);
+
+    printf("          ZenTCP 3-way handshake, PSH+ACK, FIN EOF & HTTP/1.1 GET verified. [PASS]\n");
+}
+
 int main(void) {
     printf("====================================================\n");
     printf("      ZenRTOS Host Verification Test Suite         \n");
@@ -717,9 +835,10 @@ int main(void) {
     test_zen_net_arp_and_dhcp();
     test_zen_net_icmp_and_udp();
     test_zen_net_utils_dns_and_sntp();
+    test_zen_tcp_and_http();
 
     printf("====================================================\n");
-    printf("  ALL 16 UNIT TESTS PASSED SUCCESSFULLY! (100%%)     \n");
+    printf("  ALL 17 UNIT TESTS PASSED SUCCESSFULLY! (100%%)     \n");
     printf("====================================================\n");
     return 0;
 }

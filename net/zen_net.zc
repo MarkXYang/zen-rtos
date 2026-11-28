@@ -6,6 +6,9 @@
 import "rtos.h" as rtos;
 
 extern fn bsp_uart_puts(s: char*);
+extern fn zen_tcp_init();
+extern fn zen_tcp_rx_ip4(src_ip: u32, payload: u8*, len: usize);
+extern fn zen_tcp_tick(now_ms: u32);
 
 // ===========================================================================
 // Constants
@@ -15,6 +18,7 @@ def ETH_TYPE_IPV4: u16       = 0x0800;
 def ETH_TYPE_ARP: u16        = 0x0806;
 
 def IP_PROTO_ICMP: u8        = 1;
+def IP_PROTO_TCP: u8         = 6;
 def IP_PROTO_UDP: u8         = 17;
 
 def ICMP_TYPE_ECHO_REPLY: u8 = 0;
@@ -486,6 +490,11 @@ fn ip4_send(dst_ip: u32, proto: u8, payload: u8*, payload_len: u16) -> i32 {
     return eth_tx_raw(&g_tx_frame[0], (u16)total_eth_len);
 }
 
+@used
+fn zen_net_ip4_send(dst_ip: u32, proto: u8, payload: u8*, payload_len: u16) -> i32 {
+    return ip4_send(dst_ip, proto, payload, payload_len);
+}
+
 // ===========================================================================
 // UDP Transmit Helper (RFC 768)
 // ===========================================================================
@@ -832,6 +841,8 @@ fn ipv4_rx(src_mac: u8*, payload: u8*, len: usize) {
 
     if proto == IP_PROTO_ICMP {
         icmp_rx(src_ip, ttl, l4_payload, l4_len);
+    } else if proto == IP_PROTO_TCP {
+        zen_tcp_rx_ip4(src_ip, l4_payload, l4_len);
     } else if proto == IP_PROTO_UDP {
         udp_rx(src_ip, l4_payload, l4_len);
     }
@@ -876,6 +887,7 @@ fn zen_net_init(mac: u8*, tx_cb: void*) {
         i = i + 1;
     }
     rtos::rtos_sem_init(&g_ping_sem, 0, 1);
+    zen_tcp_init();
     g_net_inited = true;
 }
 
@@ -961,6 +973,7 @@ fn zen_net_tick(now_ms: u32) {
     if !g_link_up {
         return;
     }
+    zen_tcp_tick(now_ms);
 
     // DHCPv4 periodic retransmit (every 2000 ms while SELECTING or REQUESTING)
     if g_dhcp_state == DHCP_SELECTING {

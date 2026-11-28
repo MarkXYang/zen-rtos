@@ -75,6 +75,12 @@ extern fn zen_syslog_get_ip() -> u32;
 extern fn zen_syslog_get_port() -> u16;
 extern fn zen_syslog_send(msg: char*) -> i32;
 
+// ZenTCP Phase 4 API (net/zen_tcp.zc)
+extern fn zen_http_get(host: char*, port: u16, path: char*,
+                       out_buf: u8*, cap: u16, timeout_ms: u32) -> i32;
+
+let g_http_rx_buf: u8[1024];
+
 fn wifi_put_hex_byte(b: u8) {
     let hex: char* = "0123456789ABCDEF";
     bsp_uart_putc(hex[(b >> 4) & 0xF]);
@@ -720,9 +726,75 @@ fn cmd_syslog(cmd: char*) {
     bsp_uart_puts("\n");
 }
 
+fn cmd_http(cmd: char*) {
+    if !wifi_starts_with(cmd, "http get ") {
+        bsp_uart_puts("Usage: http get <host> [path] [port]\n");
+        return;
+    }
+    if !zen_net_is_up() {
+        bsp_uart_puts("Network interface is DOWN.\n");
+        return;
+    }
+    let arg: char* = &cmd[9];
+    let host: char[64];
+    if wifi_copy_token(arg, &host[0], 64) == 0 {
+        bsp_uart_puts("Usage: http get <host> [path] [port]\n");
+        return;
+    }
+    let path: char[64];
+    let p_path: char* = wifi_skip_token(arg);
+    let port: u32 = 80;
+    if p_path[0] != '\0' {
+        let _pl: u32 = wifi_copy_token(p_path, &path[0], 64);
+        let p_port: char* = wifi_skip_token(p_path);
+        if p_port[0] != '\0' {
+            let parsed: u32 = 0;
+            if wifi_parse_u32(p_port, &parsed) && parsed > 0 && parsed <= 65535 {
+                port = parsed;
+            }
+        }
+    } else {
+        path[0] = '/';
+        path[1] = '\0';
+    }
+
+    bsp_uart_puts("HTTP GET http://");
+    bsp_uart_puts(&host[0]);
+    if port != 80 {
+        bsp_uart_putc(':');
+        bsp_uart_putdec(port);
+    }
+    bsp_uart_puts(&path[0]);
+    bsp_uart_puts(" ...\n");
+
+    let n: i32 = zen_http_get(&host[0], (u16)port, &path[0], &g_http_rx_buf[0], (u16)1024, 4000);
+    if n < 0 {
+        bsp_uart_puts("HTTP GET failed (err=");
+        wifi_put_i32(n);
+        bsp_uart_puts(")\n");
+        return;
+    }
+    bsp_uart_puts("--- HTTP Response (");
+    bsp_uart_putdec((u32)n);
+    bsp_uart_puts(" B) ---\n");
+    let i: i32 = 0;
+    while i < n {
+        bsp_uart_putc((char)g_http_rx_buf[i]);
+        if (i & 63) == 63 {
+            rtos::rtos_delay(2); // Pace USB-Serial/JTAG 64B EP1 FIFO
+        }
+        i = i + 1;
+    }
+    bsp_uart_puts("\n--- End HTTP ---\n");
+}
+
 // Exported hook called by bsp/esp32c6/esp32c6.zc zensh> shell
 @used
 fn bsp_wifi_shell_cmd(cmd: char*) -> bool {
+    if wifi_starts_with(cmd, "http") && (cmd[4] == '\0' || cmd[4] == ' ') {
+        cmd_http(cmd);
+        return true;
+    }
     if wifi_starts_with(cmd, "ifconfig") && (cmd[8] == '\0' || cmd[8] == ' ') {
         cmd_ifconfig(cmd);
         return true;

@@ -450,6 +450,7 @@ fn bsp_shell_exec(raw_cmd: char*, sensor_q: rtos::rtos_queue_t*,
         bsp_uart_puts("  arp [flush]     - Display or flush IPv4 -> MAC neighbor cache\n");
         bsp_uart_puts("  netstat         - Show L2/ARP/ICMP/UDP counters & bound UDP ports\n");
         bsp_uart_puts("  udp <subcmd>    - UDP tools (send <host> <port> <msg> | listen | echo)\n");
+        bsp_uart_puts("  http get <host> [path] [port] - HTTP/1.1 GET over native ZenTCP\n");
         bsp_uart_puts("  syslog <subcmd> - Remote UDP syslog (<ip> [port] | send <msg> | off)\n");
         bsp_uart_puts("  clear           - Clear terminal screen\n");
     } else if bsp_streq(cmd, "ps") || bsp_streq(cmd, "top") {

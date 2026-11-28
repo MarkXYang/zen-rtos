@@ -105,7 +105,7 @@ test: $(BUILD_DIR)/test_scheduler
 	@echo "--- Executing ZenRTOS Host Test Suite ---"
 	@./$(BUILD_DIR)/test_scheduler
 
-$(BUILD_DIR)/test_scheduler: tests/host/test_scheduler.c kernel/rtos.c $(BUILD_DIR)/esp32c6_wpa2_crypto_zc.c $(BUILD_DIR)/zen_net_zc.c $(BUILD_DIR)/net_utils_zc.c
+$(BUILD_DIR)/test_scheduler: tests/host/test_scheduler.c kernel/rtos.c $(BUILD_DIR)/esp32c6_wpa2_crypto_zc.c $(BUILD_DIR)/zen_net_zc.c $(BUILD_DIR)/net_utils_zc.c $(BUILD_DIR)/zen_tcp_zc.c
 	@mkdir -p $(BUILD_DIR)
 	$(CC_HOST) $(CFLAGS_HOST) $^ -o $@
 
@@ -157,6 +157,11 @@ $(BUILD_DIR)/net_utils_zc.c: net/net_utils.zc kernel/include/rtos.h
 	@mkdir -p $(BUILD_DIR)
 	@echo "--- Transpiling Zen-C Network Utilities (net/net_utils.zc) to C ---"
 	$(ZC) transpile --freestanding net/net_utils.zc -Ikernel/include -o $(BUILD_DIR)/net_utils_zc.c
+
+$(BUILD_DIR)/zen_tcp_zc.c: net/zen_tcp.zc kernel/include/rtos.h
+	@mkdir -p $(BUILD_DIR)
+	@echo "--- Transpiling Zen-C Native TCP/HTTP Stack (net/zen_tcp.zc) to C ---"
+	$(ZC) transpile --freestanding net/zen_tcp.zc -Ikernel/include -o $(BUILD_DIR)/zen_tcp_zc.c
 
 $(BUILD_DIR)/rt1021_zc.c: bsp/rt1021/rt1021.zc kernel/include/rtos.h
 	@mkdir -p $(BUILD_DIR)
@@ -219,6 +224,7 @@ $(BUILD_DIR)/zen_rtos_esp32c6_wifi.elf: kernel/rtos.c \
                                         $(BUILD_DIR)/esp32c6_wifi_wpa2_zc.c \
                                         $(BUILD_DIR)/zen_net_zc.c \
                                         $(BUILD_DIR)/net_utils_zc.c \
+                                        $(BUILD_DIR)/zen_tcp_zc.c \
                                         app/main_zc.c
 	@if [ ! -f "$(ESP32C6_WIFI_DIR)/lib/libnet80211.a" ] || [ ! -f "$(ESP32C6_WIFI_DIR)/include/phy_init_data.c" ]; then \
 		./scripts/fetch_esp32c6_wifi_blobs.sh; \
