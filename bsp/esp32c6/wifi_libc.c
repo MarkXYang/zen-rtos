@@ -18,6 +18,17 @@ void  free(void *p)                     { wifi_heap_free(p); }
 void *memcpy(void *dst, const void *src, size_t n) {
     uint8_t *d = (uint8_t *)dst;
     const uint8_t *s = (const uint8_t *)src;
+    // Use 32-bit word copies when 4-byte aligned (required by ESP32-C6 APB/MAC MMIO key RAM @ 0x600A5808!)
+    if ((((uintptr_t)d | (uintptr_t)s) & 3U) == 0U) {
+        volatile uint32_t *dw = (volatile uint32_t *)d;
+        const uint32_t *sw = (const uint32_t *)s;
+        while (n >= 4U) {
+            *dw++ = *sw++;
+            n -= 4U;
+        }
+        d = (uint8_t *)dw;
+        s = (const uint8_t *)sw;
+    }
     while (n--) *d++ = *s++;
     return dst;
 }
@@ -37,7 +48,17 @@ void *memmove(void *dst, const void *src, size_t n) {
 
 void *memset(void *dst, int c, size_t n) {
     uint8_t *d = (uint8_t *)dst;
-    while (n--) *d++ = (uint8_t)c;
+    uint8_t b = (uint8_t)c;
+    if (((uintptr_t)d & 3U) == 0U && n >= 4U) {
+        uint32_t w = (uint32_t)b | ((uint32_t)b << 8) | ((uint32_t)b << 16) | ((uint32_t)b << 24);
+        volatile uint32_t *dw = (volatile uint32_t *)d;
+        while (n >= 4U) {
+            *dw++ = w;
+            n -= 4U;
+        }
+        d = (uint8_t *)dw;
+    }
+    while (n--) *d++ = b;
     return dst;
 }
 

@@ -1,5 +1,10 @@
-// ZenRTOS ESP32-C6 Wi-Fi Shell & Zen-C API Module
-// Implements: wifi mac | wifi scan | wifi connect <ssid> [pass] | wifi status | wifi disconnect
+// ZenRTOS ESP32-C6 Wi-Fi & ZenNet Shell Module in Zen-C
+// Implements: wifi [mac|scan|connect|status|disconnect]
+//             ifconfig [dhcp | <ip> <mask> <gw> [dns]]
+//             ping <ip> [count] | arp [flush | probe <ip>] | netstat
+//             udp send <ip> <port> <msg>
+
+import "rtos.h" as rtos;
 
 extern fn bsp_uart_puts(s: char*);
 extern fn bsp_uart_putc(c: char);
@@ -13,11 +18,65 @@ extern fn wifi_drv_disconnect() -> i32;
 extern fn wifi_drv_get_state() -> i32;
 extern fn wifi_drv_get_ssid() -> char*;
 extern fn wifi_drv_free_heap() -> u32;
+extern fn wifi_drv_sta_input_count() -> u32;
+extern fn wifi_drv_dump_rx_diag();
+
+// ZenNet Micro-IPv4 API (net/zen_net.zc)
+struct ShellNetStats {
+    rx_frames: u32;
+    tx_frames: u32;
+    rx_bytes: u32;
+    tx_bytes: u32;
+    arp_rx: u32;
+    arp_tx: u32;
+    icmp_rx: u32;
+    icmp_tx: u32;
+    udp_rx: u32;
+    udp_tx: u32;
+    checksum_drops: u32;
+}
+
+extern fn zen_net_dhcp_start();
+extern fn zen_net_set_static(ip: u32, mask: u32, gw: u32, dns: u32);
+extern fn zen_net_is_up() -> bool;
+extern fn zen_net_link_is_up() -> bool;
+extern fn zen_net_get_dhcp_state() -> u32;
+extern fn zen_net_get_ip() -> u32;
+extern fn zen_net_get_netmask() -> u32;
+extern fn zen_net_get_gateway() -> u32;
+extern fn zen_net_get_dns() -> u32;
+extern fn zen_net_get_lease_rem_sec() -> u32;
+extern fn zen_net_get_stats(out: ShellNetStats*);
+extern fn zen_net_arp_flush();
+extern fn zen_net_arp_probe(ip: u32);
+extern fn zen_net_arp_get_entry(idx: u32, out_ip: u32*, out_mac: u8*, out_age_sec: u32*) -> bool;
+extern fn zen_net_ping(dst_ip: u32, seq: u16, timeout_ms: u32, out_rtt_ms: u32*, out_ttl: u8*) -> bool;
+extern fn zen_udp_slot_port(slot: i32) -> u16;
+extern fn zen_udp_sendto(src_port: u16, dst_ip: u32, dst_port: u16, data: u8*, len: u16) -> i32;
+extern fn zen_ip4_parse(s: char*, out_ip: u32*) -> bool;
+extern fn zen_ip4_format(ip: u32, buf: char*, cap: usize);
 
 fn wifi_put_hex_byte(b: u8) {
     let hex: char* = "0123456789ABCDEF";
     bsp_uart_putc(hex[(b >> 4) & 0xF]);
     bsp_uart_putc(hex[b & 0xF]);
+}
+
+fn wifi_put_mac_raw(mac: u8*) {
+    let i: u32 = 0;
+    while i < 6 {
+        wifi_put_hex_byte(mac[i]);
+        if i < 5 {
+            bsp_uart_putc(':');
+        }
+        i = i + 1;
+    }
+}
+
+fn wifi_put_ip(ip: u32) {
+    let buf: char[16];
+    zen_ip4_format(ip, &buf[0], 16);
+    bsp_uart_puts(&buf[0]);
 }
 
 fn wifi_starts_with(s: char*, prefix: char*) -> bool {
@@ -42,18 +101,36 @@ fn wifi_starts_with(s: char*, prefix: char*) -> bool {
     return true;
 }
 
+fn wifi_parse_u32(s: char*, out_val: u32*) -> bool {
+    if s[0] < '0' || s[0] > '9' {
+        return false;
+    }
+    let v: u32 = 0;
+    let i: u32 = 0;
+    while s[i] >= '0' && s[i] <= '9' {
+        v = v * 10 + (u32)((u8)s[i] - (u8)'0');
+        i = i + 1;
+    }
+    *out_val = v;
+    return true;
+}
+
+fn wifi_skip_token(s: char*) -> char* {
+    let i: u32 = 0;
+    while s[i] != '\0' && s[i] != ' ' {
+        i = i + 1;
+    }
+    while s[i] == ' ' {
+        i = i + 1;
+    }
+    return &s[i];
+}
+
 fn wifi_print_mac() {
     let mac: u8[6];
     wifi_drv_read_mac(&mac[0]);
     bsp_uart_puts("ESP32-C6 STA MAC   : ");
-    let i: u32 = 0;
-    while i < 6 {
-        wifi_put_hex_byte(mac[i]);
-        if i < 5 {
-            bsp_uart_putc(':');
-        }
-        i = i + 1;
-    }
+    wifi_put_mac_raw(&mac[0]);
     bsp_uart_puts("\n");
 }
 
@@ -80,14 +157,309 @@ fn wifi_print_status() {
         bsp_uart_puts(ssid);
         bsp_uart_puts("\n");
     }
+    if zen_net_is_up() {
+        bsp_uart_puts("IPv4 Address       : ");
+        wifi_put_ip(zen_net_get_ip());
+        bsp_uart_puts("\n");
+    }
     bsp_uart_puts("Wi-Fi Heap Free    : ");
     bsp_uart_putdec(wifi_drv_free_heap());
     bsp_uart_puts(" B\n");
+    wifi_drv_dump_rx_diag();
+}
+
+fn cmd_ifconfig(cmd: char*) {
+    if wifi_starts_with(cmd, "ifconfig dhcp") {
+        bsp_uart_puts("[net] Starting DHCPv4 lease discovery...\n");
+        zen_net_dhcp_start();
+        return;
+    }
+    if cmd[8] == ' ' {
+        let p1: char* = &cmd[9];
+        let ip: u32 = 0;
+        let mask: u32 = 0;
+        let gw: u32 = 0;
+        let dns: u32 = 0;
+        if zen_ip4_parse(p1, &ip) {
+            let p2: char* = wifi_skip_token(p1);
+            let p3: char* = wifi_skip_token(p2);
+            let p4: char* = wifi_skip_token(p3);
+            if zen_ip4_parse(p2, &mask) && zen_ip4_parse(p3, &gw) {
+                if !zen_ip4_parse(p4, &dns) {
+                    dns = gw;
+                }
+                zen_net_set_static(ip, mask, gw, dns);
+                bsp_uart_puts("[net] Static IPv4 configured: ");
+                wifi_put_ip(ip);
+                bsp_uart_puts("\n");
+                return;
+            }
+        }
+        bsp_uart_puts("Usage: ifconfig [dhcp | <ip> <mask> <gw> [dns]]\n");
+        return;
+    }
+
+    let mac: u8[6];
+    wifi_drv_read_mac(&mac[0]);
+    bsp_uart_puts("wlan0     Link: ");
+    if zen_net_link_is_up() {
+        bsp_uart_puts("UP");
+    } else {
+        bsp_uart_puts("DOWN");
+    }
+    let ssid: char* = wifi_drv_get_ssid();
+    if ssid[0] != '\0' {
+        bsp_uart_puts(" (SSID: ");
+        bsp_uart_puts(ssid);
+        bsp_uart_puts(")");
+    }
+    bsp_uart_puts("\n          HWaddr: ");
+    wifi_put_mac_raw(&mac[0]);
+    bsp_uart_puts("\n          inet:   ");
+    wifi_put_ip(zen_net_get_ip());
+    bsp_uart_puts("  netmask: ");
+    wifi_put_ip(zen_net_get_netmask());
+    bsp_uart_puts("  gw: ");
+    wifi_put_ip(zen_net_get_gateway());
+    bsp_uart_puts("\n          dns:    ");
+    wifi_put_ip(zen_net_get_dns());
+    let ds: u32 = zen_net_get_dhcp_state();
+    bsp_uart_puts("  mode: ");
+    if ds == 0 { bsp_uart_puts("OFF\n"); }
+    else if ds == 1 { bsp_uart_puts("DHCP-SELECTING\n"); }
+    else if ds == 2 { bsp_uart_puts("DHCP-REQUESTING\n"); }
+    else if ds == 3 {
+        bsp_uart_puts("DHCP-BOUND (lease ");
+        bsp_uart_putdec(zen_net_get_lease_rem_sec());
+        bsp_uart_puts("s rem)\n");
+    } else if ds == 4 { bsp_uart_puts("STATIC\n"); }
+    else { bsp_uart_puts("UNKNOWN\n"); }
+}
+
+fn cmd_arp(cmd: char*) {
+    if wifi_starts_with(cmd, "arp flush") {
+        zen_net_arp_flush();
+        bsp_uart_puts("ARP cache flushed.\n");
+        return;
+    }
+    if wifi_starts_with(cmd, "arp probe ") {
+        let ip: u32 = 0;
+        if zen_ip4_parse(&cmd[10], &ip) {
+            zen_net_arp_probe(ip);
+            bsp_uart_puts("Sent ARP probe for ");
+            wifi_put_ip(ip);
+            bsp_uart_puts("\n");
+        } else {
+            bsp_uart_puts("Usage: arp probe <ip>\n");
+        }
+        return;
+    }
+    bsp_uart_puts("  IPv4 Address      HW Address          Age\n");
+    let count: u32 = 0;
+    let i: u32 = 0;
+    while i < 8 {
+        let ip: u32 = 0;
+        let mac: u8[6];
+        let age: u32 = 0;
+        if zen_net_arp_get_entry(i, &ip, &mac[0], &age) {
+            bsp_uart_puts("  ");
+            wifi_put_ip(ip);
+            bsp_uart_puts("    ");
+            wifi_put_mac_raw(&mac[0]);
+            bsp_uart_puts("   ");
+            bsp_uart_putdec(age);
+            bsp_uart_puts("s\n");
+            count = count + 1;
+        }
+        i = i + 1;
+    }
+    if count == 0 {
+        bsp_uart_puts("  (ARP cache empty)\n");
+    }
+}
+
+fn cmd_netstat() {
+    let st: ShellNetStats;
+    zen_net_get_stats(&st);
+    bsp_uart_puts("  L2 Frames : ");
+    bsp_uart_putdec(st.rx_frames);
+    bsp_uart_puts(" rx (");
+    bsp_uart_putdec(st.rx_bytes);
+    bsp_uart_puts(" B) | ");
+    bsp_uart_putdec(st.tx_frames);
+    bsp_uart_puts(" tx (");
+    bsp_uart_putdec(st.tx_bytes);
+    bsp_uart_puts(" B) | ");
+    bsp_uart_putdec(st.checksum_drops);
+    bsp_uart_puts(" csum drops\n");
+
+    bsp_uart_puts("  Protocols : ARP=");
+    bsp_uart_putdec(st.arp_rx + st.arp_tx);
+    bsp_uart_puts("  ICMP=");
+    bsp_uart_putdec(st.icmp_rx + st.icmp_tx);
+    bsp_uart_puts("  UDP=");
+    bsp_uart_putdec(st.udp_rx + st.udp_tx);
+    bsp_uart_puts("\n  UDP Ports : :68 (dhcpc)");
+    let i: i32 = 0;
+    while i < 4 {
+        let p: u16 = zen_udp_slot_port(i);
+        if p != 0 {
+            bsp_uart_puts(", :");
+            bsp_uart_putdec((u32)p);
+        }
+        i = i + 1;
+    }
+    bsp_uart_puts("\n");
+}
+
+fn cmd_ping(cmd: char*) {
+    if !zen_net_is_up() {
+        bsp_uart_puts("Network interface is DOWN (connect to Wi-Fi and wait for DHCP).\n");
+        return;
+    }
+    let ip: u32 = 0;
+    let arg: char* = &cmd[5];
+    if !zen_ip4_parse(arg, &ip) {
+        bsp_uart_puts("Usage: ping <ipv4> [count]\n");
+        return;
+    }
+    let count: u32 = 4;
+    let cnt_str: char* = wifi_skip_token(arg);
+    if cnt_str[0] != '\0' {
+        let parsed: u32 = 0;
+        if wifi_parse_u32(cnt_str, &parsed) && parsed > 0 && parsed <= 20 {
+            count = parsed;
+        }
+    }
+
+    bsp_uart_puts("PING ");
+    wifi_put_ip(ip);
+    bsp_uart_puts(": 32 data bytes\n");
+
+    let rx_ok: u32 = 0;
+    let rtt_min: u32 = 0xFFFFFFFF;
+    let rtt_max: u32 = 0;
+    let rtt_sum: u32 = 0;
+
+    let seq: u32 = 1;
+    while seq <= count {
+        let rtt: u32 = 0;
+        let ttl: u8 = 0;
+        if zen_net_ping(ip, (u16)seq, 1000, &rtt, &ttl) {
+            bsp_uart_puts("  Reply from ");
+            wifi_put_ip(ip);
+            bsp_uart_puts(": seq=");
+            bsp_uart_putdec(seq);
+            bsp_uart_puts(" ttl=");
+            bsp_uart_putdec((u32)ttl);
+            bsp_uart_puts(" time=");
+            bsp_uart_putdec(rtt);
+            bsp_uart_puts(" ms\n");
+            rx_ok = rx_ok + 1;
+            rtt_sum = rtt_sum + rtt;
+            if rtt < rtt_min { rtt_min = rtt; }
+            if rtt > rtt_max { rtt_max = rtt; }
+        } else {
+            bsp_uart_puts("  Request timed out (seq=");
+            bsp_uart_putdec(seq);
+            bsp_uart_puts(")\n");
+        }
+        if seq < count {
+            rtos::rtos_delay(500);
+        }
+        seq = seq + 1;
+    }
+
+    let loss: u32 = ((count - rx_ok) * 100) / count;
+    bsp_uart_puts("--- ");
+    wifi_put_ip(ip);
+    bsp_uart_puts(" ping stats: ");
+    bsp_uart_putdec(count);
+    bsp_uart_puts(" tx, ");
+    bsp_uart_putdec(rx_ok);
+    bsp_uart_puts(" rx, ");
+    bsp_uart_putdec(loss);
+    bsp_uart_puts("% loss");
+    if rx_ok > 0 {
+        bsp_uart_puts(", rtt min/avg/max = ");
+        bsp_uart_putdec(rtt_min);
+        bsp_uart_putc('/');
+        bsp_uart_putdec(rtt_sum / rx_ok);
+        bsp_uart_putc('/');
+        bsp_uart_putdec(rtt_max);
+        bsp_uart_puts(" ms");
+    }
+    bsp_uart_puts(" ---\n");
+}
+
+fn cmd_udp(cmd: char*) {
+    if !wifi_starts_with(cmd, "udp send ") {
+        bsp_uart_puts("Usage: udp send <ipv4> <port> <message>\n");
+        return;
+    }
+    if !zen_net_is_up() {
+        bsp_uart_puts("Network interface is DOWN.\n");
+        return;
+    }
+    let p_ip: char* = &cmd[9];
+    let dst_ip: u32 = 0;
+    if !zen_ip4_parse(p_ip, &dst_ip) {
+        bsp_uart_puts("Invalid IPv4 address.\n");
+        return;
+    }
+    let p_port: char* = wifi_skip_token(p_ip);
+    let port: u32 = 0;
+    if !wifi_parse_u32(p_port, &port) || port == 0 || port > 65535 {
+        bsp_uart_puts("Invalid UDP port.\n");
+        return;
+    }
+    let msg: char* = wifi_skip_token(p_port);
+    let mlen: u32 = 0;
+    while msg[mlen] != '\0' {
+        mlen = mlen + 1;
+    }
+    if mlen == 0 {
+        bsp_uart_puts("Usage: udp send <ipv4> <port> <message>\n");
+        return;
+    }
+    let rc: i32 = zen_udp_sendto((u16)0, dst_ip, (u16)port, (u8*)msg, (u16)mlen);
+    if rc == 0 {
+        bsp_uart_puts("Sent ");
+        bsp_uart_putdec(mlen);
+        bsp_uart_puts("-byte UDP datagram to ");
+        wifi_put_ip(dst_ip);
+        bsp_uart_putc(':');
+        bsp_uart_putdec(port);
+        bsp_uart_puts("\n");
+    } else {
+        bsp_uart_puts("UDP send failed.\n");
+    }
 }
 
 // Exported hook called by bsp/esp32c6/esp32c6.zc zensh> shell
 @used
 fn bsp_wifi_shell_cmd(cmd: char*) -> bool {
+    if wifi_starts_with(cmd, "ifconfig") && (cmd[8] == '\0' || cmd[8] == ' ') {
+        cmd_ifconfig(cmd);
+        return true;
+    }
+    if wifi_starts_with(cmd, "arp") && (cmd[3] == '\0' || cmd[3] == ' ') {
+        cmd_arp(cmd);
+        return true;
+    }
+    if wifi_starts_with(cmd, "netstat") && (cmd[7] == '\0' || cmd[7] == ' ') {
+        cmd_netstat();
+        return true;
+    }
+    if wifi_starts_with(cmd, "ping ") {
+        cmd_ping(cmd);
+        return true;
+    }
+    if wifi_starts_with(cmd, "udp") && (cmd[3] == '\0' || cmd[3] == ' ') {
+        cmd_udp(cmd);
+        return true;
+    }
+
     if !wifi_starts_with(cmd, "wifi") {
         return false;
     }

@@ -443,6 +443,11 @@ fn bsp_shell_exec(raw_cmd: char*, sensor_q: rtos::rtos_queue_t*,
         bsp_uart_puts("  fault           - Show RISC-V post-mortem exception CSR record\n");
         bsp_uart_puts("  uptime          - Show system tick counter and uptime\n");
         bsp_uart_puts("  wifi <subcmd>   - Wi-Fi control (mac|scan|connect|status|disconnect)\n");
+        bsp_uart_puts("  ifconfig        - Show IPv4/DHCP config (or 'ifconfig dhcp' / static)\n");
+        bsp_uart_puts("  ping <ip> [n]   - Send ICMPv4 echo requests & measure RTT\n");
+        bsp_uart_puts("  arp [flush]     - Display or flush IPv4 -> MAC neighbor cache\n");
+        bsp_uart_puts("  netstat         - Show L2/ARP/ICMP/UDP counters & bound UDP ports\n");
+        bsp_uart_puts("  udp send <ip> <port> <msg> - Send a UDP datagram\n");
         bsp_uart_puts("  clear           - Clear terminal screen\n");
     } else if bsp_streq(cmd, "ps") || bsp_streq(cmd, "top") {
         bsp_debug_dump_status_table(latest_temp);

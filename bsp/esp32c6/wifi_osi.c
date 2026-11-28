@@ -12,6 +12,13 @@
 #include "phy.h"
 #include "phy_init_data.h"
 #include "wifi_wpa2.h"
+#include "zen_net.h"
+
+static rtos_timer_t s_net_tick_timer;
+static void wifi_net_tick_cb(void *arg) {
+    (void)arg;
+    zen_net_tick(rtos_get_tick());
+}
 
 // ---------------------------------------------------------------------------
 // External ZenRTOS, ROM & BSP Helpers
@@ -331,7 +338,7 @@ static rtos_timer_t *osi_find_or_alloc_timer(void *ptimer, bool alloc_if_missing
     for (int i = 0; i < MAX_OSI_TIMERS; i++) {
         if (s_timer_slots[i].ptimer_key == NULL) {
             s_timer_slots[i].ptimer_key = ptimer;
-            memset(&s_timer_slots[i].rt, 0, sizeof(rtos_timer_t));
+            rtos_timer_init(&s_timer_slots[i].rt, NULL, NULL);
             return &s_timer_slots[i].rt;
         }
     }
@@ -693,6 +700,24 @@ int32_t wifi_drv_eth_tx(const uint8_t *frame, uint16_t len) {
 
 uint32_t wifi_drv_l2_rx_count(void) { return g_l2_rx_frames; }
 uint32_t wifi_drv_l2_tx_count(void) { return g_l2_tx_frames; }
+uint32_t wifi_drv_sta_input_count(void) { return *(volatile uint32_t *)0x40845f18UL; }
+void wifi_drv_dump_rx_diag(void) {
+    uint32_t sta_in   = *(volatile uint32_t *)0x40845f18UL;
+    uint32_t sta_data = *(volatile uint32_t *)0x40845f1cUL;
+    uint32_t v0       = *(volatile uint32_t *)0x40847a2cUL;
+    uint32_t ni       = v0 ? *(volatile uint32_t *)(v0 + 0xe4UL) : 0;
+    uint8_t  uk       = ni ? *(volatile uint8_t *)(ni + 0x134UL) : 0xFF;
+    uint8_t  gk2      = ni ? *(volatile uint8_t *)(ni + 0x139UL) : 0xFF;
+    uint32_t k0       = *(volatile uint32_t *)0x40847b64UL;
+    uint32_t k1       = *(volatile uint32_t *)0x40847b68UL;
+    uint32_t k4       = *(volatile uint32_t *)0x40847b74UL;
+    char buf[128];
+    snprintf(buf, sizeof(buf),
+             "RX Diag            : sta_in=%u sta_data=%u uk=%u gk2=%u k0=%x k1=%x k4=%x\n",
+             (unsigned)sta_in, (unsigned)sta_data, (unsigned)uk, (unsigned)gk2,
+             (unsigned)k0, (unsigned)k1, (unsigned)k4);
+    bsp_uart_puts(buf);
+}
 
 static int32_t osi_event_post(const char *base, int32_t id, void *data, size_t len, uint32_t wait) {
     (void)base; (void)wait;
@@ -701,12 +726,13 @@ static int32_t osi_event_post(const char *base, int32_t id, void *data, size_t l
         g_wifi_state = 1;
     } else if (id == 4) {
         g_wifi_state = 4;
-        (void)esp_wifi_internal_reg_rxcb(WIFI_IF_STA, wifi_l2_rx_trampoline);
-        bsp_uart_puts("[wifi] Connected to AP (L2 link UP)\n");
+        uint32_t rxcb_val = *(volatile uint32_t *)0x4087ff8cUL;
+        char dbg[72];
+        snprintf(dbg, sizeof(dbg), "[wifi] Connected to AP (L2 link UP, rxcb=0x%08x)\n", (unsigned)rxcb_val);
+        bsp_uart_puts(dbg);
         if (s_l2_link_cb) s_l2_link_cb(true);
     } else if (id == 5) {
         g_wifi_state = 1;
-        (void)esp_wifi_internal_reg_rxcb(WIFI_IF_STA, NULL);
         wifi_wpa2_reset();
         uint8_t reason = 0;
         if (data && len >= sizeof(wifi_event_sta_disconnected_t)) {
@@ -1066,6 +1092,16 @@ int32_t wifi_drv_init(void) {
     err = esp_wifi_start();
     if (err == 0) {
         esp_wifi_set_ps(WIFI_PS_NONE);
+        uint8_t sta_mac[6];
+        wifi_drv_read_mac(sta_mac);
+        zen_net_init(sta_mac, (void *)wifi_drv_eth_tx);
+        wifi_drv_set_l2_callbacks(zen_net_rx_frame, zen_net_set_link);
+        esp_err_t rx_err = esp_wifi_internal_reg_rxcb(WIFI_IF_STA, wifi_l2_rx_trampoline);
+        if (rx_err != 0) {
+            bsp_uart_puts("[wifi] WARN: esp_wifi_internal_reg_rxcb failed\n");
+        }
+        rtos_timer_init(&s_net_tick_timer, wifi_net_tick_cb, NULL);
+        rtos_timer_start(&s_net_tick_timer, 200, true);
         g_wifi_state = 1;
         rtos_delay(50); // Allow async STA_START to settle in wifi task
     }

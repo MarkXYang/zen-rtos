@@ -5,6 +5,7 @@
 // BSP UART helpers
 extern fn bsp_uart_puts(s: char*);
 extern fn bsp_uart_putc(c: char);
+extern fn bsp_uart_putdec(val: u32);
 
 // Freestanding byte helpers shared from bsp/esp32c6/wpa2_crypto.zc
 extern fn mem_copy(dst: u8*, src: u8*, n: usize);
@@ -331,7 +332,7 @@ fn wifi_wpa2_reset() {
     s_has_pending_gtk = false;
 }
 
-fn install_gtk_now(gtk: u8*, gtk_len: usize, key_idx: u8, rsc: u8*) {
+fn install_gtk_now(gtk: u8*, gtk_len: usize, key_idx: u8, rsc: u8*) -> i32 {
     let alg: i32 = WIFI_WPA_ALG_CCMP;
     if gtk_len == 32 {
         alg = WIFI_WPA_ALG_TKIP;
@@ -342,7 +343,7 @@ fn install_gtk_now(gtk: u8*, gtk_len: usize, key_idx: u8, rsc: u8*) {
 
     let key_buf: u8[32];
     if gtk_len > 32 {
-        return;
+        return -1;
     }
     mem_copy(&key_buf[0], gtk, gtk_len);
     if alg == WIFI_WPA_ALG_TKIP && gtk_len == 32 {
@@ -354,9 +355,10 @@ fn install_gtk_now(gtk: u8*, gtk_len: usize, key_idx: u8, rsc: u8*) {
         mem_copy(&key_buf[24], &tmp[0], 8);
     }
 
-    let _rc: i32 = esp_wifi_set_sta_key_internal(alg, &s_ap_bssid[0], (i32)key_idx, 0,
-                                                 &seq[0], 6, &key_buf[0], gtk_len,
-                                                 KEY_FLAG_GROUP | KEY_FLAG_RX);
+    let bcast: u8[6] = [ 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF ];
+    return esp_wifi_set_sta_key_internal(alg, &bcast[0], (i32)key_idx, 0,
+                                         &seq[0], 6, &key_buf[0], gtk_len,
+                                         KEY_FLAG_GROUP | KEY_FLAG_RX);
 }
 
 fn wifi_wpa2_eapol_txcb(eapol_payload: u8*, len: usize, tx_failure: bool) {
@@ -384,23 +386,37 @@ fn wifi_wpa2_eapol_txcb(eapol_payload: u8*, len: usize, tx_failure: bool) {
     s_waiting_m4_txdone = false;
 
     // Install Pairwise Key (PTK TK = s_ptk[32..47], 16B AES-CCMP) AFTER Msg 4/4 was sent unencrypted
+    let ptk_rc: i32 = -99;
     if s_pending_ptk_install && !s_ptk_installed {
         let zero_seq: u8[8];
         mem_zero(&zero_seq[0], 8);
-        let _rc: i32 = esp_wifi_set_sta_key_internal(WIFI_WPA_ALG_CCMP, &s_ap_bssid[0], 0, 1,
-                                                     &zero_seq[0], 6, &s_ptk[32], 16,
-                                                     KEY_FLAG_PAIRWISE | KEY_FLAG_RX | KEY_FLAG_TX);
+        ptk_rc = esp_wifi_set_sta_key_internal(WIFI_WPA_ALG_CCMP, &s_ap_bssid[0], 0, 1,
+                                               &zero_seq[0], 6, &s_ptk[32], 16,
+                                               KEY_FLAG_PAIRWISE | KEY_FLAG_RX | KEY_FLAG_TX);
         s_ptk_installed = true;
     }
 
     // Install Group Key (GTK) unwrapped from Msg 3/4
+    let gtk_rc: i32 = -99;
+    let gtk_ok: u32 = 0;
     if s_has_pending_gtk {
-        install_gtk_now(&s_pending_gtk[0], s_pending_gtk_len, s_pending_gtk_idx, &s_pending_gtk_rsc[0]);
+        gtk_ok = 1;
+        gtk_rc = install_gtk_now(&s_pending_gtk[0], s_pending_gtk_len, s_pending_gtk_idx, &s_pending_gtk_rsc[0]);
         s_has_pending_gtk = false;
     }
 
     s_in_4way = false;
-    bsp_uart_puts("[wpa2] 4-way handshake complete (PTK+GTK installed)\n");
+    bsp_uart_puts("[wpa2] 4-way complete (ptk_rc=");
+    bsp_uart_putdec((u32)ptk_rc);
+    bsp_uart_puts(" gtk=");
+    bsp_uart_putdec(gtk_ok);
+    bsp_uart_puts(" len=");
+    bsp_uart_putdec((u32)s_pending_gtk_len);
+    bsp_uart_puts(" idx=");
+    bsp_uart_putdec((u32)s_pending_gtk_idx);
+    bsp_uart_puts(" gtk_rc=");
+    bsp_uart_putdec((u32)gtk_rc);
+    bsp_uart_puts(")\n");
     let _ok: bool = esp_wifi_auth_done_internal();
 }
 
@@ -731,7 +747,7 @@ fn wifi_wpa2_sta_rx_eapol(_src_addr: u8*, buf: u8*, len: u32) -> i32 {
             let gtk_idx: u8 = 0;
             if wpa2_aes_unwrap(&s_ptk[16], n_blocks, kd, &plain[0]) == 0 &&
                extract_gtk_kde(&plain[0], n_blocks * 8, &gtk[0], &gtk_len, &gtk_idx) {
-                install_gtk_now(&gtk[0], gtk_len, gtk_idx, rsc);
+                let _grc: i32 = install_gtk_now(&gtk[0], gtk_len, gtk_idx, rsc);
             }
         }
         let gm2_info: u16 = (u16)((u32)key_ver | (1 << 8) | (1 << 9));

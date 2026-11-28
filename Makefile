@@ -7,7 +7,7 @@ CLANG         ?= clang
 LLVM_OBJCOPY  ?= llvm-objcopy
 
 CC_HOST       ?= gcc
-CFLAGS_HOST   ?= -Wall -Wextra -O2 -Ikernel/include -Ibsp/esp32c6 -DRTOS_HOST_TEST \
+CFLAGS_HOST   ?= -Wall -Wextra -O2 -Ikernel/include -Ibsp/esp32c6 -Inet/include -DRTOS_HOST_TEST \
                  -Wno-unused-parameter -Wno-unused-variable -Wno-unused-function \
                  -DZC_FUNC= -DZC_GLOBAL=
 
@@ -48,7 +48,7 @@ CFLAGS_ESP32C6_WIFI ?= --target=riscv32-unknown-elf -march=rv32imac_zicsr_zifenc
                        -Wno-unused-parameter -Wno-unused-variable -Wno-unused-function \
                        -Wno-parentheses-equality \
                        -DRTOS_ARCH_RISCV -DZC_FUNC= -DZC_GLOBAL= \
-                       -Ikernel/include -Ibsp/esp32c6 -I$(ESP32C6_WIFI_DIR)/include -Iarch/riscv/rv32 \
+                       -Ikernel/include -Ibsp/esp32c6 -Inet/include -I$(ESP32C6_WIFI_DIR)/include -Iarch/riscv/rv32 \
                        -fdata-sections -ffunction-sections
 
 LDFLAGS_ESP32C6_WIFI ?= --target=riscv32-unknown-elf -march=rv32imac_zicsr_zifencei -mabi=ilp32 \
@@ -105,7 +105,7 @@ test: $(BUILD_DIR)/test_scheduler
 	@echo "--- Executing ZenRTOS Host Test Suite ---"
 	@./$(BUILD_DIR)/test_scheduler
 
-$(BUILD_DIR)/test_scheduler: tests/host/test_scheduler.c kernel/rtos.c $(BUILD_DIR)/esp32c6_wpa2_crypto_zc.c
+$(BUILD_DIR)/test_scheduler: tests/host/test_scheduler.c kernel/rtos.c $(BUILD_DIR)/esp32c6_wpa2_crypto_zc.c $(BUILD_DIR)/zen_net_zc.c
 	@mkdir -p $(BUILD_DIR)
 	$(CC_HOST) $(CFLAGS_HOST) $^ -o $@
 
@@ -142,6 +142,11 @@ $(BUILD_DIR)/esp32c6_wifi_wpa2_zc.c: bsp/esp32c6/wifi_wpa2.zc
 	@mkdir -p $(BUILD_DIR)
 	@echo "--- Transpiling Zen-C ESP32-C6 WPA2 Supplicant (bsp/esp32c6/wifi_wpa2.zc) to C ---"
 	$(ZC) transpile --freestanding bsp/esp32c6/wifi_wpa2.zc -Ikernel/include -o $(BUILD_DIR)/esp32c6_wifi_wpa2_zc.c
+
+$(BUILD_DIR)/zen_net_zc.c: net/zen_net.zc kernel/include/rtos.h
+	@mkdir -p $(BUILD_DIR)
+	@echo "--- Transpiling Zen-C Micro-IPv4 Stack (net/zen_net.zc) to C ---"
+	$(ZC) transpile --freestanding net/zen_net.zc -Ikernel/include -o $(BUILD_DIR)/zen_net_zc.c
 
 $(BUILD_DIR)/rt1021_zc.c: bsp/rt1021/rt1021.zc kernel/include/rtos.h
 	@mkdir -p $(BUILD_DIR)
@@ -202,6 +207,7 @@ $(BUILD_DIR)/zen_rtos_esp32c6_wifi.elf: kernel/rtos.c \
                                         $(BUILD_DIR)/esp32c6_wifi_zc.c \
                                         $(BUILD_DIR)/esp32c6_wpa2_crypto_zc.c \
                                         $(BUILD_DIR)/esp32c6_wifi_wpa2_zc.c \
+                                        $(BUILD_DIR)/zen_net_zc.c \
                                         app/main_zc.c
 	@if [ ! -f "$(ESP32C6_WIFI_DIR)/lib/libnet80211.a" ] || [ ! -f "$(ESP32C6_WIFI_DIR)/include/phy_init_data.c" ]; then \
 		./scripts/fetch_esp32c6_wifi_blobs.sh; \

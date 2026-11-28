@@ -1,0 +1,1186 @@
+// ZenNet Micro-IPv4 Stack in Zen-C
+// Implements Ethernet II demux, 8-entry ARP cache + 1-packet pending TX queue,
+// IPv4, DHCPv4 Client (DISCOVER/OFFER/REQUEST/ACK + T1 renew), bidirectional
+// ICMPv4 Echo (ping), and a 4-slot RTOS-semaphore-backed UDP Socket API.
+
+import "rtos.h" as rtos;
+
+extern fn bsp_uart_puts(s: char*);
+
+// ===========================================================================
+// Constants
+// ===========================================================================
+def ETH_HDR_LEN: usize       = 14;
+def ETH_TYPE_IPV4: u16       = 0x0800;
+def ETH_TYPE_ARP: u16        = 0x0806;
+
+def IP_PROTO_ICMP: u8        = 1;
+def IP_PROTO_UDP: u8         = 17;
+
+def ICMP_TYPE_ECHO_REPLY: u8 = 0;
+def ICMP_TYPE_ECHO_REQ: u8   = 8;
+def ICMP_PING_ID: u16        = 0x5A4E; // "ZN"
+
+def DHCP_CLIENT_PORT: u16    = 68;
+def DHCP_SERVER_PORT: u16    = 67;
+def DHCP_OFF: u32            = 0;
+def DHCP_SELECTING: u32      = 1;
+def DHCP_REQUESTING: u32     = 2;
+def DHCP_BOUND: u32          = 3;
+def DHCP_STATIC: u32         = 4;
+
+def ARP_TABLE_SIZE: u32      = 8;
+def ARP_TTL_MS: u32          = 300000; // 300 seconds
+def UDP_MAX_SOCKETS: u32     = 4;
+def UDP_RX_BUF_CAP: usize    = 512;
+def MAX_FRAME_LEN: usize     = 1518;
+
+// ===========================================================================
+// Structs
+// ===========================================================================
+struct ZenNetStats {
+    rx_frames: u32;
+    tx_frames: u32;
+    rx_bytes: u32;
+    tx_bytes: u32;
+    arp_rx: u32;
+    arp_tx: u32;
+    icmp_rx: u32;
+    icmp_tx: u32;
+    udp_rx: u32;
+    udp_tx: u32;
+    checksum_drops: u32;
+}
+
+struct ArpEntry {
+    valid: bool;
+    ip: u32;
+    mac: u8[6];
+    stamp_ms: u32;
+}
+
+struct UdpSocket {
+    in_use: bool;
+    local_port: u16;
+    has_pkt: bool;
+    src_ip: u32;
+    src_port: u16;
+    rx_len: u16;
+    rx_buf: u8[512];
+    rx_sem: rtos::rtos_sem_t;
+}
+
+// ===========================================================================
+// Module State
+// ===========================================================================
+let g_net_inited: bool = false;
+let g_link_up: bool = false;
+let g_our_mac: u8[6];
+let g_tx_cb: void* = (void*)0;
+
+let g_our_ip: u32 = 0;
+let g_netmask: u32 = 0;
+let g_gateway_ip: u32 = 0;
+let g_dns_ip: u32 = 0;
+
+let g_dhcp_state: u32 = 0;
+let g_dhcp_xid: u32 = 0x5A454E01;
+let g_dhcp_server_ip: u32 = 0;
+let g_dhcp_offered_ip: u32 = 0;
+let g_dhcp_last_tx_ms: u32 = 0;
+let g_dhcp_lease_sec: u32 = 0;
+let g_dhcp_bound_ms: u32 = 0;
+
+let g_ip_id: u16 = 1;
+let g_ephemeral_port: u16 = 49152;
+let g_now_ms: u32 = 0;
+
+let g_stats: ZenNetStats;
+let g_arp_table: ArpEntry[8];
+let g_udp_socks: UdpSocket[4];
+
+// Single-packet pending TX buffer while awaiting ARP resolution
+let g_pending_valid: bool = false;
+let g_pending_next_hop: u32 = 0;
+let g_pending_len: u16 = 0;
+let g_pending_frame: u8[1518];
+
+// Scratch TX frame & L4 payload buffers (static to keep task/timer stack usage < 256B)
+let g_tx_frame: u8[1518];
+let g_udp_tx_buf: u8[1480];
+let g_icmp_reply_buf: u8[1460];
+let g_dhcp_tx_buf: u8[300];
+
+// Ping waiter state
+let g_ping_waiting: bool = false;
+let g_ping_expect_ip: u32 = 0;
+let g_ping_expect_seq: u16 = 0;
+let g_ping_got_reply: bool = false;
+let g_ping_reply_ttl: u8 = 0;
+let g_ping_reply_ms: u32 = 0;
+let g_ping_sem: rtos::rtos_sem_t;
+
+// ===========================================================================
+// Freestanding Byte, Endian & Checksum Helpers
+// ===========================================================================
+fn net_copy(dst: u8*, src: u8*, n: usize) {
+    let i: usize = 0;
+    while i < n {
+        dst[i] = src[i];
+        i = i + 1;
+    }
+}
+
+fn net_zero(dst: u8*, n: usize) {
+    let i: usize = 0;
+    while i < n {
+        dst[i] = (u8)0;
+        i = i + 1;
+    }
+}
+
+fn net_cmp(a: u8*, b: u8*, n: usize) -> bool {
+    let i: usize = 0;
+    while i < n {
+        if a[i] != b[i] {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+@inline
+fn rd_be16(p: u8*) -> u16 {
+    return ((u16)p[0] << 8) | (u16)p[1];
+}
+
+@inline
+fn rd_be32(p: u8*) -> u32 {
+    return ((u32)p[0] << 24) | ((u32)p[1] << 16) | ((u32)p[2] << 8) | (u32)p[3];
+}
+
+@inline
+fn wr_be16(p: u8*, v: u16) {
+    p[0] = (u8)(v >> 8);
+    p[1] = (u8)(v & 0xFF);
+}
+
+@inline
+fn wr_be32(p: u8*, v: u32) {
+    p[0] = (u8)(v >> 24);
+    p[1] = (u8)((v >> 16) & 0xFF);
+    p[2] = (u8)((v >> 8) & 0xFF);
+    p[3] = (u8)(v & 0xFF);
+}
+
+@used
+fn zen_inet_checksum(data: u8*, len: usize) -> u16 {
+    let sum: u32 = 0;
+    let i: usize = 0;
+    while i + 1 < len {
+        let word: u32 = ((u32)data[i] << 8) | (u32)data[i + 1];
+        sum = sum + word;
+        i = i + 2;
+    }
+    if i < len {
+        sum = sum + ((u32)data[i] << 8);
+    }
+    while (sum >> 16) != 0 {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+    return (u16)((~sum) & 0xFFFF);
+}
+
+@used
+fn zen_ip4_parse(s: char*, out_ip: u32*) -> bool {
+    if s == (char*)0 || out_ip == (u32*)0 {
+        return false;
+    }
+    let ip: u32 = 0;
+    let idx: usize = 0;
+    let oct: u32 = 0;
+    while oct < 4 {
+        if s[idx] < '0' || s[idx] > '9' {
+            return false;
+        }
+        let val: u32 = 0;
+        let digits: u32 = 0;
+        while s[idx] >= '0' && s[idx] <= '9' {
+            val = val * 10 + (u32)((u8)s[idx] - (u8)'0');
+            if val > 255 {
+                return false;
+            }
+            idx = idx + 1;
+            digits = digits + 1;
+        }
+        if digits == 0 {
+            return false;
+        }
+        ip = (ip << 8) | val;
+        if oct < 3 {
+            if s[idx] != '.' {
+                return false;
+            }
+            idx = idx + 1;
+        }
+        oct = oct + 1;
+    }
+    if s[idx] != '\0' && s[idx] != ' ' && s[idx] != '\t' && s[idx] != '\r' && s[idx] != '\n' {
+        return false;
+    }
+    *out_ip = ip;
+    return true;
+}
+
+fn fmt_u8_dec(v: u8, buf: char*, pos: usize, cap: usize) -> usize {
+    let p: usize = pos;
+    if v >= 100 {
+        if p + 1 < cap { buf[p] = (char)((u8)'0' + (v / 100)); p = p + 1; }
+    }
+    if v >= 10 {
+        if p + 1 < cap { buf[p] = (char)((u8)'0' + ((v / 10) % 10)); p = p + 1; }
+    }
+    if p + 1 < cap { buf[p] = (char)((u8)'0' + (v % 10)); p = p + 1; }
+    return p;
+}
+
+@used
+fn zen_ip4_format(ip: u32, buf: char*, cap: usize) {
+    if buf == (char*)0 || cap == 0 {
+        return;
+    }
+    let pos: usize = 0;
+    pos = fmt_u8_dec((u8)((ip >> 24) & 0xFF), buf, pos, cap);
+    if pos + 1 < cap { buf[pos] = '.'; pos = pos + 1; }
+    pos = fmt_u8_dec((u8)((ip >> 16) & 0xFF), buf, pos, cap);
+    if pos + 1 < cap { buf[pos] = '.'; pos = pos + 1; }
+    pos = fmt_u8_dec((u8)((ip >> 8) & 0xFF), buf, pos, cap);
+    if pos + 1 < cap { buf[pos] = '.'; pos = pos + 1; }
+    pos = fmt_u8_dec((u8)(ip & 0xFF), buf, pos, cap);
+    buf[pos] = '\0';
+}
+
+fn net_print_ip(ip: u32) {
+    let tmp: char[16];
+    zen_ip4_format(ip, &tmp[0], 16);
+    bsp_uart_puts(&tmp[0]);
+}
+
+// ===========================================================================
+// Low-level L2 Transmit Bridge
+// ===========================================================================
+fn eth_tx_raw(_frame: u8*, len: u16) -> i32 {
+    if g_tx_cb == (void*)0 || !g_link_up || len < 14 {
+        return -1;
+    }
+    let rc: i32 = -1;
+    raw {
+        typedef int32_t (*_tx_fn_t)(const uint8_t *, uint16_t);
+        _tx_fn_t fn_ptr = (_tx_fn_t)g_tx_cb;
+        rc = fn_ptr(_frame, len);
+    }
+    if rc == 0 {
+        g_stats.tx_frames = g_stats.tx_frames + 1;
+        g_stats.tx_bytes  = g_stats.tx_bytes + (u32)len;
+    }
+    return rc;
+}
+
+// ===========================================================================
+// ARP Cache & Protocol Engine (RFC 826)
+// ===========================================================================
+fn arp_update(ip: u32, mac: u8*) {
+    if ip == 0 {
+        return;
+    }
+    let i: u32 = 0;
+    let free_idx: i32 = -1;
+    let oldest_idx: u32 = 0;
+    let oldest_age: u32 = 0;
+
+    while i < ARP_TABLE_SIZE {
+        if g_arp_table[i].valid && g_arp_table[i].ip == ip {
+            net_copy(&g_arp_table[i].mac[0], mac, 6);
+            g_arp_table[i].stamp_ms = g_now_ms;
+            return;
+        }
+        if !g_arp_table[i].valid && free_idx < 0 {
+            free_idx = (i32)i;
+        }
+        if g_arp_table[i].valid {
+            let age: u32 = g_now_ms - g_arp_table[i].stamp_ms;
+            if age >= oldest_age {
+                oldest_age = age;
+                oldest_idx = i;
+            }
+        }
+        i = i + 1;
+    }
+
+    let slot: u32 = oldest_idx;
+    if free_idx >= 0 {
+        slot = (u32)free_idx;
+    }
+    g_arp_table[slot].valid    = true;
+    g_arp_table[slot].ip       = ip;
+    net_copy(&g_arp_table[slot].mac[0], mac, 6);
+    g_arp_table[slot].stamp_ms = g_now_ms;
+}
+
+fn arp_lookup(ip: u32, mac_out: u8*) -> bool {
+    let i: u32 = 0;
+    while i < ARP_TABLE_SIZE {
+        if g_arp_table[i].valid && g_arp_table[i].ip == ip {
+            if (g_now_ms - g_arp_table[i].stamp_ms) <= ARP_TTL_MS {
+                net_copy(mac_out, &g_arp_table[i].mac[0], 6);
+                return true;
+            }
+            g_arp_table[i].valid = false;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn arp_send_pkt(op: u16, target_ip: u32, target_mac: u8*) {
+    let pkt: u8[42];
+    net_zero(&pkt[0], 42);
+
+    // Ethernet II Header
+    if op == 1 {
+        let k: u32 = 0;
+        while k < 6 { pkt[k] = (u8)0xFF; k = k + 1; }
+    } else {
+        net_copy(&pkt[0], target_mac, 6);
+    }
+    net_copy(&pkt[6], &g_our_mac[0], 6);
+    wr_be16(&pkt[12], ETH_TYPE_ARP);
+
+    // ARP Payload (28 bytes)
+    let a: u8* = &pkt[14];
+    wr_be16(&a[0], (u16)1);       // HTYPE = Ethernet
+    wr_be16(&a[2], ETH_TYPE_IPV4); // PTYPE = IPv4
+    a[4] = (u8)6;                 // HLEN
+    a[5] = (u8)4;                 // PLEN
+    wr_be16(&a[6], op);           // OPER (1=Request, 2=Reply)
+    net_copy(&a[8], &g_our_mac[0], 6);
+    wr_be32(&a[14], g_our_ip);
+    if target_mac != (u8*)0 {
+        net_copy(&a[18], target_mac, 6);
+    }
+    wr_be32(&a[24], target_ip);
+
+    g_stats.arp_tx = g_stats.arp_tx + 1;
+    let _rc: i32 = eth_tx_raw(&pkt[0], (u16)42);
+}
+
+fn arp_rx(payload: u8*, len: usize) {
+    if len < 28 {
+        return;
+    }
+    if rd_be16(&payload[0]) != 1 || rd_be16(&payload[2]) != ETH_TYPE_IPV4 {
+        return;
+    }
+    if payload[4] != 6 || payload[5] != 4 {
+        return;
+    }
+    g_stats.arp_rx = g_stats.arp_rx + 1;
+
+    let op: u16      = rd_be16(&payload[6]);
+    let sha: u8*     = &payload[8];
+    let spa: u32     = rd_be32(&payload[14]);
+    let tpa: u32     = rd_be32(&payload[24]);
+
+    if spa != 0 {
+        arp_update(spa, sha);
+    }
+
+    if op == 1 {
+        // ARP Request for our IPv4 address -> send ARP Reply
+        if g_our_ip != 0 && tpa == g_our_ip {
+            arp_send_pkt((u16)2, spa, sha);
+        }
+    } else if op == 2 {
+        // ARP Reply -> flush pending TX packet if waiting for this next hop
+        if g_pending_valid && spa == g_pending_next_hop {
+            net_copy(&g_pending_frame[0], sha, 6);
+            g_pending_valid = false;
+            let _rc: i32 = eth_tx_raw(&g_pending_frame[0], g_pending_len);
+        }
+    }
+}
+
+// ===========================================================================
+// IPv4 Transmit Helper
+// ===========================================================================
+fn ip4_send(dst_ip: u32, proto: u8, payload: u8*, payload_len: u16) -> i32 {
+    let total_ip_len: usize = 20 + (usize)payload_len;
+    let total_eth_len: usize = ETH_HDR_LEN + total_ip_len;
+    if total_eth_len > MAX_FRAME_LEN || !g_link_up {
+        return -1;
+    }
+
+    let dst_mac: u8[6];
+    let need_arp: bool = false;
+    let next_hop: u32 = dst_ip;
+
+    let is_bcast: bool = (dst_ip == (u32)0xFFFFFFFF);
+    if !is_bcast && g_netmask != 0 && g_our_ip != 0 {
+        if dst_ip == (g_our_ip | (~g_netmask)) {
+            is_bcast = true;
+        }
+    }
+
+    if is_bcast {
+        let k: u32 = 0;
+        while k < 6 { dst_mac[k] = (u8)0xFF; k = k + 1; }
+    } else {
+        if g_netmask != 0 && g_gateway_ip != 0 &&
+           ((dst_ip & g_netmask) != (g_our_ip & g_netmask)) {
+            next_hop = g_gateway_ip;
+        }
+        if !arp_lookup(next_hop, &dst_mac[0]) {
+            need_arp = true;
+            net_zero(&dst_mac[0], 6);
+        }
+    }
+
+    // Build Ethernet II header
+    net_copy(&g_tx_frame[0], &dst_mac[0], 6);
+    net_copy(&g_tx_frame[6], &g_our_mac[0], 6);
+    wr_be16(&g_tx_frame[12], ETH_TYPE_IPV4);
+
+    // Build 20-byte IPv4 header
+    let iph: u8* = &g_tx_frame[14];
+    net_zero(iph, 20);
+    iph[0] = (u8)0x45; // Version 4, IHL 5 (20B)
+    iph[1] = (u8)0x00;
+    wr_be16(&iph[2], (u16)total_ip_len);
+    wr_be16(&iph[4], g_ip_id);
+    g_ip_id = g_ip_id + (u16)1;
+    wr_be16(&iph[6], (u16)0x4000); // Don't Fragment
+    iph[8] = (u8)64;               // TTL
+    iph[9] = proto;
+    wr_be32(&iph[12], g_our_ip);
+    wr_be32(&iph[16], dst_ip);
+    let csum: u16 = zen_inet_checksum(iph, 20);
+    wr_be16(&iph[10], csum);
+
+    // Copy L4 payload
+    if payload_len > 0 {
+        net_copy(&g_tx_frame[34], payload, (usize)payload_len);
+    }
+
+    if need_arp {
+        // Queue frame for immediate transmission on ARP Reply and emit ARP Request
+        net_copy(&g_pending_frame[0], &g_tx_frame[0], total_eth_len);
+        g_pending_len      = (u16)total_eth_len;
+        g_pending_next_hop = next_hop;
+        g_pending_valid    = true;
+        arp_send_pkt((u16)1, next_hop, (u8*)0);
+        return 0;
+    }
+
+    return eth_tx_raw(&g_tx_frame[0], (u16)total_eth_len);
+}
+
+// ===========================================================================
+// UDP Transmit Helper (RFC 768)
+// ===========================================================================
+fn udp_send_internal(src_port: u16, dst_ip: u32, dst_port: u16, data: u8*, len: u16) -> i32 {
+    if (usize)len + 8 + 20 + ETH_HDR_LEN > MAX_FRAME_LEN {
+        return -1;
+    }
+    let udp_len: u16 = (u16)(8 + (u32)len);
+    wr_be16(&g_udp_tx_buf[0], src_port);
+    wr_be16(&g_udp_tx_buf[2], dst_port);
+    wr_be16(&g_udp_tx_buf[4], udp_len);
+    wr_be16(&g_udp_tx_buf[6], (u16)0); // Compute RFC 768 checksum below
+    if len > 0 && data != (u8*)0 {
+        net_copy(&g_udp_tx_buf[8], data, (usize)len);
+    }
+
+    // Compute UDP pseudo-header + payload checksum
+    let sum: u32 = 0;
+    sum = sum + ((g_our_ip >> 16) & 0xFFFF) + (g_our_ip & 0xFFFF);
+    sum = sum + ((dst_ip >> 16) & 0xFFFF) + (dst_ip & 0xFFFF);
+    sum = sum + (u32)IP_PROTO_UDP + (u32)udp_len;
+    let i: usize = 0;
+    while i + 1 < (usize)udp_len {
+        sum = sum + (((u32)g_udp_tx_buf[i] << 8) | (u32)g_udp_tx_buf[i + 1]);
+        i = i + 2;
+    }
+    if i < (usize)udp_len {
+        sum = sum + ((u32)g_udp_tx_buf[i] << 8);
+    }
+    while (sum >> 16) != 0 {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+    let csum: u16 = (u16)((~sum) & 0xFFFF);
+    if csum == 0 {
+        csum = (u16)0xFFFF;
+    }
+    wr_be16(&g_udp_tx_buf[6], csum);
+
+    g_stats.udp_tx = g_stats.udp_tx + 1;
+    return ip4_send(dst_ip, IP_PROTO_UDP, &g_udp_tx_buf[0], udp_len);
+}
+
+// ===========================================================================
+// DHCPv4 Client State Machine (RFC 2131)
+// ===========================================================================
+fn dhcp_send_msg(msg_type: u8, req_ip: u32, server_ip: u32) {
+    net_zero(&g_dhcp_tx_buf[0], 300);
+
+    g_dhcp_tx_buf[0] = (u8)1; // BOOTREQUEST
+    g_dhcp_tx_buf[1] = (u8)1; // Ethernet
+    g_dhcp_tx_buf[2] = (u8)6; // HLEN = 6
+    g_dhcp_tx_buf[3] = (u8)0; // HOPS
+    wr_be32(&g_dhcp_tx_buf[4], g_dhcp_xid);
+    wr_be16(&g_dhcp_tx_buf[10], (u16)0x8000); // Broadcast flag
+    net_copy(&g_dhcp_tx_buf[28], &g_our_mac[0], 6);
+
+    // DHCP Magic Cookie: 99.130.83.99
+    g_dhcp_tx_buf[236] = (u8)99;
+    g_dhcp_tx_buf[237] = (u8)130;
+    g_dhcp_tx_buf[238] = (u8)83;
+    g_dhcp_tx_buf[239] = (u8)99;
+
+    let p: usize = 240;
+    // Option 53: DHCP Message Type
+    g_dhcp_tx_buf[p] = (u8)53; g_dhcp_tx_buf[p + 1] = (u8)1; g_dhcp_tx_buf[p + 2] = msg_type;
+    p = p + 3;
+
+    // Option 61: Client Identifier (type 1 + MAC)
+    g_dhcp_tx_buf[p] = (u8)61; g_dhcp_tx_buf[p + 1] = (u8)7; g_dhcp_tx_buf[p + 2] = (u8)1;
+    net_copy(&g_dhcp_tx_buf[p + 3], &g_our_mac[0], 6);
+    p = p + 9;
+
+    if msg_type == 3 {
+        // Option 50: Requested IP Address
+        g_dhcp_tx_buf[p] = (u8)50; g_dhcp_tx_buf[p + 1] = (u8)4;
+        wr_be32(&g_dhcp_tx_buf[p + 2], req_ip);
+        p = p + 6;
+        // Option 54: Server Identifier
+        if server_ip != 0 {
+            g_dhcp_tx_buf[p] = (u8)54; g_dhcp_tx_buf[p + 1] = (u8)4;
+            wr_be32(&g_dhcp_tx_buf[p + 2], server_ip);
+            p = p + 6;
+        }
+    }
+
+    // Option 55: Parameter Request List (Subnet Mask, Router, DNS, Lease Time)
+    g_dhcp_tx_buf[p] = (u8)55; g_dhcp_tx_buf[p + 1] = (u8)4;
+    g_dhcp_tx_buf[p + 2] = (u8)1;
+    g_dhcp_tx_buf[p + 3] = (u8)3;
+    g_dhcp_tx_buf[p + 4] = (u8)6;
+    g_dhcp_tx_buf[p + 5] = (u8)51;
+    p = p + 6;
+
+    // Option 255: End
+    g_dhcp_tx_buf[p] = (u8)255;
+    p = p + 1;
+
+    g_dhcp_last_tx_ms = g_now_ms;
+    let _rc: i32 = udp_send_internal(DHCP_CLIENT_PORT, (u32)0xFFFFFFFF, DHCP_SERVER_PORT, &g_dhcp_tx_buf[0], (u16)300);
+}
+
+fn dhcp_rx(payload: u8*, len: usize) {
+    if len < 244 {
+        return;
+    }
+    if payload[0] != 2 {
+        return; // Must be BOOTREPLY
+    }
+    if rd_be32(&payload[4]) != g_dhcp_xid {
+        return;
+    }
+    if !net_cmp(&payload[28], &g_our_mac[0], 6) {
+        return;
+    }
+    if payload[236] != 99 || payload[237] != 130 || payload[238] != 83 || payload[239] != 99 {
+        return;
+    }
+
+    let yiaddr: u32 = rd_be32(&payload[16]);
+    let msg_type: u8 = 0;
+    let opt_mask: u32 = (u32)0xFFFFFF00;
+    let opt_gw: u32 = 0;
+    let opt_dns: u32 = 0;
+    let opt_srv: u32 = 0;
+    let opt_lease: u32 = 3600;
+
+    let pos: usize = 240;
+    while pos < len {
+        let code: u8 = payload[pos];
+        if code == 255 {
+            break;
+        }
+        if code == 0 {
+            pos = pos + 1;
+            continue;
+        }
+        if pos + 1 >= len {
+            break;
+        }
+        let olen: usize = (usize)payload[pos + 1];
+        if pos + 2 + olen > len {
+            break;
+        }
+        let od: u8* = &payload[pos + 2];
+        if code == 53 && olen >= 1 {
+            msg_type = od[0];
+        } else if code == 1 && olen >= 4 {
+            opt_mask = rd_be32(od);
+        } else if code == 3 && olen >= 4 {
+            opt_gw = rd_be32(od);
+        } else if code == 6 && olen >= 4 {
+            opt_dns = rd_be32(od);
+        } else if code == 51 && olen >= 4 {
+            opt_lease = rd_be32(od);
+        } else if code == 54 && olen >= 4 {
+            opt_srv = rd_be32(od);
+        }
+        pos = pos + 2 + olen;
+    }
+
+    if g_dhcp_state == DHCP_SELECTING && msg_type == 2 && yiaddr != 0 {
+        // DHCPOFFER received -> send DHCPREQUEST
+        g_dhcp_offered_ip = yiaddr;
+        g_dhcp_server_ip  = opt_srv;
+        g_dhcp_state      = DHCP_REQUESTING;
+        dhcp_send_msg((u8)3, yiaddr, opt_srv);
+    } else if g_dhcp_state == DHCP_REQUESTING && msg_type == 5 && yiaddr != 0 {
+        // DHCPACK received -> commit IPv4 configuration
+        g_our_ip         = yiaddr;
+        g_netmask        = opt_mask;
+        g_gateway_ip     = opt_gw;
+        g_dns_ip         = opt_dns;
+        if g_dns_ip == 0 {
+            g_dns_ip = opt_gw;
+        }
+        g_dhcp_lease_sec = opt_lease;
+        g_dhcp_bound_ms  = g_now_ms;
+        g_dhcp_state     = DHCP_BOUND;
+
+        bsp_uart_puts("[net] DHCP bound: IP ");
+        net_print_ip(g_our_ip);
+        bsp_uart_puts(" | Mask ");
+        net_print_ip(g_netmask);
+        bsp_uart_puts(" | GW ");
+        net_print_ip(g_gateway_ip);
+        bsp_uart_puts(" | DNS ");
+        net_print_ip(g_dns_ip);
+        bsp_uart_puts("\n");
+
+        // Proactively resolve gateway MAC into ARP cache
+        if g_gateway_ip != 0 {
+            arp_send_pkt((u16)1, g_gateway_ip, (u8*)0);
+        }
+    } else if msg_type == 6 && g_dhcp_state == DHCP_REQUESTING {
+        // DHCPNAK -> restart discovery
+        g_dhcp_xid   = g_dhcp_xid + 1;
+        g_dhcp_state = DHCP_SELECTING;
+        dhcp_send_msg((u8)1, 0, 0);
+    }
+}
+
+// ===========================================================================
+// ICMPv4 Echo Handler (RFC 792)
+// ===========================================================================
+fn icmp_rx(src_ip: u32, ttl: u8, payload: u8*, len: usize) {
+    if len < 8 {
+        return;
+    }
+    if zen_inet_checksum(payload, len) != 0 {
+        g_stats.checksum_drops = g_stats.checksum_drops + 1;
+        return;
+    }
+    g_stats.icmp_rx = g_stats.icmp_rx + 1;
+
+    let icmp_type: u8 = payload[0];
+    let icmp_code: u8 = payload[1];
+
+    if icmp_type == ICMP_TYPE_ECHO_REQ && icmp_code == 0 {
+        // Reply immediately to inbound ping (e.g. from Linux host!)
+        let reply_len: usize = len;
+        if reply_len > 1460 {
+            reply_len = 1460;
+        }
+        net_copy(&g_icmp_reply_buf[0], payload, reply_len);
+        g_icmp_reply_buf[0] = ICMP_TYPE_ECHO_REPLY;
+        g_icmp_reply_buf[2] = (u8)0;
+        g_icmp_reply_buf[3] = (u8)0;
+        let csum: u16 = zen_inet_checksum(&g_icmp_reply_buf[0], reply_len);
+        wr_be16(&g_icmp_reply_buf[2], csum);
+        g_stats.icmp_tx = g_stats.icmp_tx + 1;
+        let _rc: i32 = ip4_send(src_ip, IP_PROTO_ICMP, &g_icmp_reply_buf[0], (u16)reply_len);
+    } else if icmp_type == ICMP_TYPE_ECHO_REPLY && icmp_code == 0 {
+        let id: u16  = rd_be16(&payload[4]);
+        let seq: u16 = rd_be16(&payload[6]);
+        if g_ping_waiting && id == ICMP_PING_ID && seq == g_ping_expect_seq && src_ip == g_ping_expect_ip {
+            g_ping_got_reply = true;
+            g_ping_reply_ttl = ttl;
+            g_ping_reply_ms  = rtos::rtos_get_tick();
+            g_ping_waiting   = false;
+            rtos::rtos_sem_signal(&g_ping_sem);
+        }
+    }
+}
+
+// ===========================================================================
+// UDP Receive Demux
+// ===========================================================================
+fn udp_rx(src_ip: u32, payload: u8*, len: usize) {
+    if len < 8 {
+        return;
+    }
+    let src_port: u16 = rd_be16(&payload[0]);
+    let dst_port: u16 = rd_be16(&payload[2]);
+    let udp_len: u16  = rd_be16(&payload[4]);
+    if (usize)udp_len < 8 || (usize)udp_len > len {
+        return;
+    }
+    g_stats.udp_rx = g_stats.udp_rx + 1;
+
+    let data: u8* = &payload[8];
+    let data_len: usize = (usize)udp_len - 8;
+
+    // Built-in DHCPv4 client hook (port 68)
+    if dst_port == DHCP_CLIENT_PORT && (g_dhcp_state == DHCP_SELECTING || g_dhcp_state == DHCP_REQUESTING) {
+        dhcp_rx(data, data_len);
+        return;
+    }
+
+    // Dispatch to bound ZenNet UDP sockets
+    let i: u32 = 0;
+    while i < UDP_MAX_SOCKETS {
+        if g_udp_socks[i].in_use && g_udp_socks[i].local_port == dst_port {
+            let copy_len: usize = data_len;
+            if copy_len > UDP_RX_BUF_CAP {
+                copy_len = UDP_RX_BUF_CAP;
+            }
+            if copy_len > 0 {
+                net_copy(&g_udp_socks[i].rx_buf[0], data, copy_len);
+            }
+            g_udp_socks[i].src_ip   = src_ip;
+            g_udp_socks[i].src_port = src_port;
+            g_udp_socks[i].rx_len   = (u16)copy_len;
+            g_udp_socks[i].has_pkt  = true;
+            rtos::rtos_sem_signal(&g_udp_socks[i].rx_sem);
+            return;
+        }
+        i = i + 1;
+    }
+}
+
+// ===========================================================================
+// IPv4 Receive Demux
+// ===========================================================================
+fn ipv4_rx(src_mac: u8*, payload: u8*, len: usize) {
+    if len < 20 {
+        return;
+    }
+    let ver: u8 = (payload[0] >> 4) & 0x0F;
+    let ihl: usize = (usize)(payload[0] & 0x0F) * 4;
+    if ver != 4 || ihl < 20 || ihl > len {
+        return;
+    }
+    let total_len: usize = (usize)rd_be16(&payload[2]);
+    if total_len < ihl || total_len > len {
+        return;
+    }
+    if zen_inet_checksum(payload, ihl) != 0 {
+        g_stats.checksum_drops = g_stats.checksum_drops + 1;
+        return;
+    }
+
+    let ttl: u8    = payload[8];
+    let proto: u8  = payload[9];
+    let src_ip: u32 = rd_be32(&payload[12]);
+    let dst_ip: u32 = rd_be32(&payload[16]);
+
+    // Learn on-link peer MAC passively when on same subnet
+    if src_ip != 0 && g_our_ip != 0 && g_netmask != 0 &&
+       ((src_ip & g_netmask) == (g_our_ip & g_netmask)) {
+        arp_update(src_ip, src_mac);
+    }
+
+    // Filter destination IP (allow broadcast & DHCP responses when IP=0)
+    let accept: bool = false;
+    if dst_ip == (u32)0xFFFFFFFF {
+        accept = true;
+    } else if g_our_ip != 0 && (dst_ip == g_our_ip || (g_netmask != 0 && dst_ip == (g_our_ip | (~g_netmask)))) {
+        accept = true;
+    } else if g_our_ip == 0 && proto == IP_PROTO_UDP {
+        accept = true;
+    }
+    if !accept {
+        return;
+    }
+
+    let l4_payload: u8* = &payload[ihl];
+    let l4_len: usize   = total_len - ihl;
+
+    if proto == IP_PROTO_ICMP {
+        icmp_rx(src_ip, ttl, l4_payload, l4_len);
+    } else if proto == IP_PROTO_UDP {
+        udp_rx(src_ip, l4_payload, l4_len);
+    }
+}
+
+// ===========================================================================
+// Public Core API (matches net/include/zen_net.h)
+// ===========================================================================
+@used
+fn zen_net_init(mac: u8*, tx_cb: void*) {
+    if mac != (u8*)0 {
+        net_copy(&g_our_mac[0], mac, 6);
+    }
+    g_tx_cb           = tx_cb;
+    g_link_up         = false;
+    g_our_ip          = 0;
+    g_netmask         = 0;
+    g_gateway_ip      = 0;
+    g_dns_ip          = 0;
+    g_dhcp_state      = DHCP_OFF;
+    g_dhcp_lease_sec  = 0;
+    g_pending_valid   = false;
+    g_ping_waiting    = false;
+    g_ping_got_reply  = false;
+    g_now_ms          = rtos::rtos_get_tick();
+
+    // Seed DHCP XID from MAC lower 4 bytes so it's unique per device
+    g_dhcp_xid = ((u32)g_our_mac[2] << 24) | ((u32)g_our_mac[3] << 16) |
+                 ((u32)g_our_mac[4] << 8)  | (u32)g_our_mac[5];
+
+    net_zero((u8*)&g_stats, sizeof(ZenNetStats));
+    let i: u32 = 0;
+    while i < ARP_TABLE_SIZE {
+        g_arp_table[i].valid = false;
+        i = i + 1;
+    }
+    i = 0;
+    while i < UDP_MAX_SOCKETS {
+        g_udp_socks[i].in_use = false;
+        g_udp_socks[i].has_pkt = false;
+        rtos::rtos_sem_init(&g_udp_socks[i].rx_sem, 0, 1);
+        i = i + 1;
+    }
+    rtos::rtos_sem_init(&g_ping_sem, 0, 1);
+    g_net_inited = true;
+}
+
+@used
+fn zen_net_dhcp_start() {
+    if !g_net_inited {
+        return;
+    }
+    g_our_ip         = 0;
+    g_netmask        = 0;
+    g_gateway_ip     = 0;
+    g_dns_ip         = 0;
+    g_dhcp_lease_sec = 0;
+    g_dhcp_xid       = g_dhcp_xid + 1;
+    g_dhcp_state     = DHCP_SELECTING;
+    g_now_ms         = rtos::rtos_get_tick();
+    if g_link_up {
+        dhcp_send_msg((u8)1, 0, 0);
+    }
+}
+
+@used
+fn zen_net_set_static(ip: u32, mask: u32, gw: u32, dns: u32) {
+    g_our_ip         = ip;
+    g_netmask        = mask;
+    g_gateway_ip     = gw;
+    g_dns_ip         = dns;
+    g_dhcp_lease_sec = 0;
+    g_dhcp_state     = DHCP_STATIC;
+}
+
+@used
+fn zen_net_set_link(up: bool) {
+    if !g_net_inited {
+        return;
+    }
+    g_link_up       = up;
+    g_pending_valid = false;
+    g_now_ms        = rtos::rtos_get_tick();
+    if up {
+        if g_dhcp_state != DHCP_STATIC {
+            zen_net_dhcp_start();
+        }
+    } else {
+        if g_dhcp_state != DHCP_STATIC {
+            g_our_ip         = 0;
+            g_netmask        = 0;
+            g_gateway_ip     = 0;
+            g_dns_ip         = 0;
+            g_dhcp_lease_sec = 0;
+            g_dhcp_state     = DHCP_OFF;
+        }
+    }
+}
+
+@used
+fn zen_net_rx_frame(frame: u8*, len: u16) {
+    if !g_net_inited || frame == (u8*)0 || len < 14 {
+        return;
+    }
+    g_now_ms = rtos::rtos_get_tick();
+    g_stats.rx_frames = g_stats.rx_frames + 1;
+    g_stats.rx_bytes  = g_stats.rx_bytes + (u32)len;
+
+    let ethertype: u16 = rd_be16(&frame[12]);
+    let payload: u8*   = &frame[14];
+    let pay_len: usize = (usize)len - 14;
+
+    if ethertype == ETH_TYPE_ARP {
+        arp_rx(payload, pay_len);
+    } else if ethertype == ETH_TYPE_IPV4 {
+        ipv4_rx(&frame[6], payload, pay_len);
+    }
+}
+
+@used
+fn zen_net_tick(now_ms: u32) {
+    if !g_net_inited {
+        return;
+    }
+    g_now_ms = now_ms;
+    if !g_link_up {
+        return;
+    }
+
+    // DHCPv4 periodic retransmit (every 2000 ms while SELECTING or REQUESTING)
+    if g_dhcp_state == DHCP_SELECTING {
+        if (now_ms - g_dhcp_last_tx_ms) >= 2000 {
+            dhcp_send_msg((u8)1, 0, 0);
+        }
+    } else if g_dhcp_state == DHCP_REQUESTING {
+        if (now_ms - g_dhcp_last_tx_ms) >= 2000 {
+            dhcp_send_msg((u8)3, g_dhcp_offered_ip, g_dhcp_server_ip);
+        }
+    } else if g_dhcp_state == DHCP_BOUND && g_dhcp_lease_sec > 0 {
+        // Renew at T1 (50% of lease duration)
+        let elapsed_s: u32 = (now_ms - g_dhcp_bound_ms) / 1000;
+        if elapsed_s >= (g_dhcp_lease_sec / 2) {
+            g_dhcp_state = DHCP_REQUESTING;
+            g_dhcp_offered_ip = g_our_ip;
+            dhcp_send_msg((u8)3, g_our_ip, g_dhcp_server_ip);
+        }
+    }
+}
+
+@used
+fn zen_net_is_up() -> bool {
+    return g_link_up && g_our_ip != 0;
+}
+
+@used
+fn zen_net_link_is_up() -> bool {
+    return g_link_up;
+}
+
+@used
+fn zen_net_get_dhcp_state() -> u32 { return g_dhcp_state; }
+
+@used
+fn zen_net_get_ip() -> u32 { return g_our_ip; }
+
+@used
+fn zen_net_get_netmask() -> u32 { return g_netmask; }
+
+@used
+fn zen_net_get_gateway() -> u32 { return g_gateway_ip; }
+
+@used
+fn zen_net_get_dns() -> u32 { return g_dns_ip; }
+
+@used
+fn zen_net_get_lease_rem_sec() -> u32 {
+    if g_dhcp_state != DHCP_BOUND || g_dhcp_lease_sec == 0 {
+        return 0;
+    }
+    let elapsed_s: u32 = (rtos::rtos_get_tick() - g_dhcp_bound_ms) / 1000;
+    if elapsed_s >= g_dhcp_lease_sec {
+        return 0;
+    }
+    return g_dhcp_lease_sec - elapsed_s;
+}
+
+@used
+fn zen_net_get_mac(mac_out: u8*) {
+    if mac_out != (u8*)0 {
+        net_copy(mac_out, &g_our_mac[0], 6);
+    }
+}
+
+@used
+fn zen_net_get_stats(out: ZenNetStats*) {
+    if out != (ZenNetStats*)0 {
+        net_copy((u8*)out, (u8*)&g_stats, sizeof(ZenNetStats));
+    }
+}
+
+@used
+fn zen_net_arp_flush() {
+    let i: u32 = 0;
+    while i < ARP_TABLE_SIZE {
+        g_arp_table[i].valid = false;
+        i = i + 1;
+    }
+}
+
+@used
+fn zen_net_arp_probe(ip: u32) {
+    if g_link_up && ip != 0 {
+        arp_send_pkt((u16)1, ip, (u8*)0);
+    }
+}
+
+@used
+fn zen_net_arp_get_entry(idx: u32, out_ip: u32*, out_mac: u8*, out_age_sec: u32*) -> bool {
+    if idx >= ARP_TABLE_SIZE || !g_arp_table[idx].valid {
+        return false;
+    }
+    if out_ip != (u32*)0 { *out_ip = g_arp_table[idx].ip; }
+    if out_mac != (u8*)0 { net_copy(out_mac, &g_arp_table[idx].mac[0], 6); }
+    if out_age_sec != (u32*)0 {
+        *out_age_sec = (rtos::rtos_get_tick() - g_arp_table[idx].stamp_ms) / 1000;
+    }
+    return true;
+}
+
+@used
+fn zen_net_ping(dst_ip: u32, seq: u16, timeout_ms: u32,
+                out_rtt_ms: u32*, out_ttl: u8*) -> bool {
+    if !zen_net_is_up() {
+        return false;
+    }
+    // Drain any stale semaphore token
+    let _dr: bool = rtos::rtos_sem_wait(&g_ping_sem, 0);
+
+    let pkt: u8[40]; // 8B ICMP header + 32B payload
+    net_zero(&pkt[0], 40);
+    pkt[0] = ICMP_TYPE_ECHO_REQ;
+    pkt[1] = (u8)0;
+    wr_be16(&pkt[4], ICMP_PING_ID);
+    wr_be16(&pkt[6], seq);
+    let k: u32 = 0;
+    while k < 32 {
+        pkt[8 + k] = (u8)(0x61 + (k % 23)); // 'a'..'w'
+        k = k + 1;
+    }
+    let csum: u16 = zen_inet_checksum(&pkt[0], 40);
+    wr_be16(&pkt[2], csum);
+
+    g_ping_expect_ip = dst_ip;
+    g_ping_expect_seq = seq;
+    g_ping_got_reply = false;
+    g_ping_waiting = true;
+
+    let t0: u32 = rtos::rtos_get_tick();
+    g_stats.icmp_tx = g_stats.icmp_tx + 1;
+    if ip4_send(dst_ip, IP_PROTO_ICMP, &pkt[0], (u16)40) != 0 {
+        g_ping_waiting = false;
+        return false;
+    }
+
+    let ok: bool = rtos::rtos_sem_wait(&g_ping_sem, timeout_ms);
+    g_ping_waiting = false;
+    if !ok || !g_ping_got_reply {
+        return false;
+    }
+    if out_rtt_ms != (u32*)0 {
+        *out_rtt_ms = g_ping_reply_ms - t0;
+    }
+    if out_ttl != (u8*)0 {
+        *out_ttl = g_ping_reply_ttl;
+    }
+    return true;
+}
+
+@used
+fn zen_udp_bind(local_port: u16) -> i32 {
+    let port: u16 = local_port;
+    if port == 0 {
+        port = g_ephemeral_port;
+        g_ephemeral_port = g_ephemeral_port + (u16)1;
+        if g_ephemeral_port < 49152 {
+            g_ephemeral_port = (u16)49152;
+        }
+    }
+    let i: u32 = 0;
+    while i < UDP_MAX_SOCKETS {
+        if !g_udp_socks[i].in_use {
+            g_udp_socks[i].in_use     = true;
+            g_udp_socks[i].local_port = port;
+            g_udp_socks[i].has_pkt    = false;
+            g_udp_socks[i].rx_len     = (u16)0;
+            let _dr: bool = rtos::rtos_sem_wait(&g_udp_socks[i].rx_sem, 0);
+            return (i32)i;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+@used
+fn zen_udp_unbind(slot: i32) {
+    if slot >= 0 && (u32)slot < UDP_MAX_SOCKETS {
+        g_udp_socks[slot].in_use  = false;
+        g_udp_socks[slot].has_pkt = false;
+    }
+}
+
+@used
+fn zen_udp_slot_port(slot: i32) -> u16 {
+    if slot >= 0 && (u32)slot < UDP_MAX_SOCKETS && g_udp_socks[slot].in_use {
+        return g_udp_socks[slot].local_port;
+    }
+    return (u16)0;
+}
+
+@used
+fn zen_udp_sendto(src_port: u16, dst_ip: u32, dst_port: u16, data: u8*, len: u16) -> i32 {
+    if !zen_net_is_up() {
+        return -1;
+    }
+    let sp: u16 = src_port;
+    if sp == 0 {
+        sp = g_ephemeral_port;
+        g_ephemeral_port = g_ephemeral_port + (u16)1;
+        if g_ephemeral_port < 49152 {
+            g_ephemeral_port = (u16)49152;
+        }
+    }
+    return udp_send_internal(sp, dst_ip, dst_port, data, len);
+}
+
+@used
+fn zen_udp_recvfrom(slot: i32, buf: u8*, cap: u16,
+                    src_ip: u32*, src_port: u16*, timeout_ms: u32) -> i32 {
+    if slot < 0 || (u32)slot >= UDP_MAX_SOCKETS || !g_udp_socks[slot].in_use {
+        return -1;
+    }
+    if !g_udp_socks[slot].has_pkt {
+        let ok: bool = rtos::rtos_sem_wait(&g_udp_socks[slot].rx_sem, timeout_ms);
+        if !ok || !g_udp_socks[slot].has_pkt {
+            return -1;
+        }
+    }
+    let n: u16 = g_udp_socks[slot].rx_len;
+    if n > cap {
+        n = cap;
+    }
+    if n > 0 && buf != (u8*)0 {
+        net_copy(buf, &g_udp_socks[slot].rx_buf[0], (usize)n);
+    }
+    if src_ip != (u32*)0 { *src_ip = g_udp_socks[slot].src_ip; }
+    if src_port != (u16*)0 { *src_port = g_udp_socks[slot].src_port; }
+    g_udp_socks[slot].has_pkt = false;
+    return (i32)n;
+}

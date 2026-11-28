@@ -454,6 +454,16 @@ uint32_t rtos_get_tick(void) {
 
 void rtos_timer_init(rtos_timer_t *timer, rtos_timer_cb_t cb, void *arg) {
     if (!timer) return;
+    uint32_t flags = rtos_irq_save();
+    // Safely unlink if this timer struct is already in g_timer_list so re-init never severs the list
+    rtos_timer_t **pp = &g_timer_list;
+    while (*pp != NULL) {
+        if (*pp == timer) {
+            *pp = timer->next;
+            break;
+        }
+        pp = &((*pp)->next);
+    }
     timer->callback = cb;
     timer->arg = arg;
     timer->period_ticks = 0;
@@ -461,6 +471,7 @@ void rtos_timer_init(rtos_timer_t *timer, rtos_timer_cb_t cb, void *arg) {
     timer->periodic = false;
     timer->active = false;
     timer->next = NULL;
+    rtos_irq_restore(flags);
 }
 
 void rtos_timer_start(rtos_timer_t *timer, uint32_t delay_ticks, bool periodic) {
