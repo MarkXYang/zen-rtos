@@ -223,10 +223,10 @@ flash: build
 		-c "program $(BUILD_DIR)/zen_rtos.elf verify reset exit"
 
 flash-esp32c6: esp32c6
-	python3 scripts/esp32c6_load.py /dev/ttyACM1 $(BUILD_DIR)/zen_rtos_esp32c6.bin
+	python3 scripts/esp32c6_load.py /dev/ttyACM0 $(BUILD_DIR)/zen_rtos_esp32c6.bin
 
 flash-esp32c6-wifi: esp32c6-wifi
-	python3 scripts/esp32c6_load.py /dev/ttyACM1 $(BUILD_DIR)/zen_rtos_esp32c6_wifi.bin --raw-flash
+	python3 scripts/esp32c6_load.py /dev/ttyACM0 $(BUILD_DIR)/zen_rtos_esp32c6_wifi.bin --raw-flash
 
 flash-rt1021: rt1021
 	@if [ "$(RT1021_BOOT)" = "ram" ]; then \
@@ -241,7 +241,7 @@ shell:
 	python3 -m serial.tools.miniterm --eol CR /dev/ttyACM0 115200
 
 shell-esp32c6:
-	python3 -m serial.tools.miniterm --eol CR /dev/ttyACM1 115200
+	python3 -m serial.tools.miniterm --eol CR /dev/ttyACM0 115200
 
 shell-rt1021:
 	python3 -m serial.tools.miniterm --eol CR /dev/ttyACM0 115200

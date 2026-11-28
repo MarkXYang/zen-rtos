@@ -95,6 +95,10 @@ extern volatile uint32_t g_isr_nest_depth;
 
 #define LP_WDEV_RNG_DATA_REG            (*(volatile uint32_t *)0x600B2800UL)
 
+#define HP_APM_FUNC_CTRL_REG            (*(volatile uint32_t *)0x600990C4UL)
+#define LP_APM0_FUNC_CTRL_REG           (*(volatile uint32_t *)0x600998C4UL)
+#define LP_APM_FUNC_CTRL_REG            (*(volatile uint32_t *)0x600B38C4UL)
+
 // ---------------------------------------------------------------------------
 // ESP32-C6 External Interrupt Dispatch (called from arch/riscv/rv32/context.s)
 // ---------------------------------------------------------------------------
@@ -535,6 +539,11 @@ static bool s_bbpll_inited = false;
 
 static void bsp_bbpll_480m_init_and_pmu_modem_on(void) {
     ets_update_cpu_frequency(160);
+    // 0. Disable ESP32-C6 APM access filters so non-CPU DMA masters (Wi-Fi MAC!) can access HP SRAM
+    HP_APM_FUNC_CTRL_REG  = 0UL;
+    LP_APM0_FUNC_CTRL_REG = 0UL;
+    LP_APM_FUNC_CTRL_REG  = 0UL;
+
     // 1. Power on Wi-Fi digital domain, BBPLL, and latch PMU HP_ACTIVE ICG state (ESP-IDF pmu_init + clk_ll_bbpll_enable)
     PMU_POWER_PD_HPWIFI_CNTL_REG  = 0UL;                        // Clear force PD/ISO/RST on HPWIFI domain
     PMU_HP_ACTIVE_DIG_POWER_REG  &= ~(1UL << 27);               // Clear PD_HP_WIFI_PD_EN
@@ -614,6 +623,9 @@ static void osi_phy_enable(void) {
     }
     bt_track_pll_cap();
     phy_wifi_enable_set(1);
+    // Ensure COEX clock stays enabled after PHY init (libphy may clear CLK_COEX_EN)
+    MODEM_LPCON_CLK_CONF_REG  |= (1UL << 0) | (1UL << 1) | (1UL << 2);
+    MODEM_LPCON_CLK_FORCE_REG |= (1UL << 1);
 }
 
 static void osi_phy_disable(void) {
@@ -924,6 +936,51 @@ extern esp_err_t esp_wifi_init_internal(const wifi_init_config_t *config);
 extern esp_err_t esp_wifi_internal_set_log_level(int level);
 extern esp_err_t esp_wifi_connect_internal(void);
 extern esp_err_t esp_wifi_disconnect_internal(void);
+extern esp_err_t esp_wifi_register_wpa_cb_internal(const void *cb);
+
+typedef struct {
+    int            proto;
+    int            pairwise_cipher;
+    int            group_cipher;
+    int            key_mgmt;
+    int            capabilities;
+    size_t         num_pmkid;
+    const uint8_t *pmkid;
+    int            mgmt_group_cipher;
+    uint8_t        rsnxe_capa;
+} wifi_wpa_ie_t;
+
+typedef struct {
+    void *fn[26];
+} wpa_funcs_compat_t;
+
+static bool osi_wpa_true(void) { return true; }
+static bool osi_wpa_false(void) { return false; }
+static int  osi_wpa_zero(void) { return 0; }
+static void osi_wpa_noop(void) {}
+static void *osi_wpa_null(void) { return NULL; }
+
+static int osi_wpa_parse_wpa_ie(const uint8_t *ie, size_t ie_len, wifi_wpa_ie_t *data) {
+    if (!ie || !data || ie_len < 4U) return -1;
+    memset(data, 0, sizeof(*data));
+    if (ie[0] == 0x30U) { // IEEE 802.11 RSN IE (WPA2/WPA3)
+        data->proto           = 2; // WPA_PROTO_RSN
+        data->pairwise_cipher = WIFI_CIPHER_TYPE_CCMP;
+        data->group_cipher    = WIFI_CIPHER_TYPE_CCMP;
+        data->key_mgmt        = 2; // WPA_KEY_MGMT_PSK
+        return 0;
+    }
+    if (ie[0] == 0xDDU) { // Microsoft WPA1 Vendor IE
+        data->proto           = 1; // WPA_PROTO_WPA
+        data->pairwise_cipher = WIFI_CIPHER_TYPE_TKIP;
+        data->group_cipher    = WIFI_CIPHER_TYPE_TKIP;
+        data->key_mgmt        = 2; // WPA_KEY_MGMT_PSK
+        return 0;
+    }
+    return -1;
+}
+
+static wpa_funcs_compat_t g_wpa_funcs_compat;
 
 static char g_wifi_ssid[33];
 
@@ -967,6 +1024,19 @@ int32_t wifi_drv_init(void) {
     esp_wifi_internal_set_log_level(2); // WIFI_LOG_WARN
     int32_t err = esp_wifi_init_internal(&cfg);
     if (err != 0) return err;
+    memset(&g_wpa_funcs_compat, 0, sizeof(g_wpa_funcs_compat));
+    g_wpa_funcs_compat.fn[0]  = (void *)osi_wpa_true;         // wpa_sta_init
+    g_wpa_funcs_compat.fn[1]  = (void *)osi_wpa_true;         // wpa_sta_deinit
+    g_wpa_funcs_compat.fn[2]  = (void *)osi_wpa_zero;         // wpa_sta_connect
+    g_wpa_funcs_compat.fn[3]  = (void *)osi_wpa_noop;         // wpa_sta_connected_cb
+    g_wpa_funcs_compat.fn[4]  = (void *)osi_wpa_noop;         // wpa_sta_disconnected_cb
+    g_wpa_funcs_compat.fn[5]  = (void *)osi_wpa_zero;         // wpa_sta_rx_eapol
+    g_wpa_funcs_compat.fn[6]  = (void *)osi_wpa_false;        // wpa_sta_in_4way_handshake
+    g_wpa_funcs_compat.fn[15] = (void *)osi_wpa_parse_wpa_ie; // wpa_parse_wpa_ie
+    g_wpa_funcs_compat.fn[17] = (void *)osi_wpa_zero;         // wpa_michael_mic_failure
+    g_wpa_funcs_compat.fn[22] = (void *)osi_wpa_noop;         // wpa_config_done
+    g_wpa_funcs_compat.fn[25] = (void *)osi_wpa_noop;         // wpa_sta_clear_curr_pmksa
+    (void)esp_wifi_register_wpa_cb_internal(&g_wpa_funcs_compat);
     err = esp_wifi_set_mode(WIFI_MODE_STA);
     if (err != 0) return err;
     err = esp_wifi_start();
@@ -996,11 +1066,13 @@ int32_t wifi_drv_scan_and_print(uint16_t *out_count) {
     if (!aps) return 0;
 
     if (esp_wifi_scan_get_ap_records(&fetch, aps) == 0) {
-        bsp_uart_puts("  Ch  RSSI   Auth      BSSID              SSID\n");
-        bsp_uart_puts("  --  -----  --------  -----------------  ------------------------\n");
+        bsp_uart_puts("  Ch  RSSI    Auth      BSSID              SSID\n");
+        rtos_delay(2);
+        bsp_uart_puts("  --  ------  --------  -----------------  ------------------------\n");
+        rtos_delay(2);
         for (uint16_t i = 0; i < fetch; i++) {
             char line[112];
-            snprintf(line, sizeof(line), "  %u   %d dBm %s  %X:%X:%X:%X:%X:%X  %s\n",
+            snprintf(line, sizeof(line), "  %2u  %3d dBm %s  %02X:%02X:%02X:%02X:%02X:%02X  %s\n",
                      (unsigned)aps[i].primary,
                      (int)aps[i].rssi,
                      auth_mode_str(aps[i].authmode),
@@ -1008,6 +1080,7 @@ int32_t wifi_drv_scan_and_print(uint16_t *out_count) {
                      aps[i].bssid[3], aps[i].bssid[4], aps[i].bssid[5],
                      (const char *)aps[i].ssid);
             bsp_uart_puts(line);
+            rtos_delay(2); // Allow 64B USB-Serial/JTAG EP1 FIFO to flush per 1ms USB frame
         }
     }
     wifi_heap_free(aps);

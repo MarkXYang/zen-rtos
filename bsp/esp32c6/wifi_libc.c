@@ -111,18 +111,19 @@ static void put_ch(char *buf, size_t cap, size_t *pos, char c) {
     (*pos)++;
 }
 
-static void put_uint(char *buf, size_t cap, size_t *pos, uint32_t v, uint32_t base, int upper) {
+static void put_uint_pad(char *buf, size_t cap, size_t *pos, uint32_t v, uint32_t base, int upper, int width, char pad) {
     char tmp[12];
     const char *digits = upper ? "0123456789ABCDEF" : "0123456789abcdef";
     int i = 0;
     if (v == 0) {
-        put_ch(buf, cap, pos, '0');
-        return;
+        tmp[i++] = '0';
+    } else {
+        while (v > 0 && i < 12) {
+            tmp[i++] = digits[v % base];
+            v /= base;
+        }
     }
-    while (v > 0 && i < 12) {
-        tmp[i++] = digits[v % base];
-        v /= base;
-    }
+    while (i < width && i < 12) tmp[i++] = pad;
     while (i > 0) put_ch(buf, cap, pos, tmp[--i]);
 }
 
@@ -134,7 +135,12 @@ int vsnprintf(char *buf, size_t cap, const char *fmt, va_list ap) {
             continue;
         }
         fmt++;
-        while (*fmt == '-' || *fmt == '+' || *fmt == ' ' || *fmt == '0' || (*fmt >= '1' && *fmt <= '9')) {
+        char pad = ' ';
+        int width = 0;
+        if (*fmt == '0') { pad = '0'; fmt++; }
+        while (*fmt == '-' || *fmt == '+' || *fmt == ' ') fmt++;
+        while (*fmt >= '0' && *fmt <= '9') {
+            width = width * 10 + (*fmt - '0');
             fmt++;
         }
         if (*fmt == 'l') fmt++;
@@ -151,21 +157,21 @@ int vsnprintf(char *buf, size_t cap, const char *fmt, va_list ap) {
                 int v = va_arg(ap, int);
                 if (v < 0) {
                     put_ch(buf, cap, &pos, '-');
-                    put_uint(buf, cap, &pos, (uint32_t)(-v), 10, 0);
+                    put_uint_pad(buf, cap, &pos, (uint32_t)(-v), 10, 0, width > 0 ? width - 1 : 0, pad);
                 } else {
-                    put_uint(buf, cap, &pos, (uint32_t)v, 10, 0);
+                    put_uint_pad(buf, cap, &pos, (uint32_t)v, 10, 0, width, pad);
                 }
                 break;
             }
             case 'u':
-                put_uint(buf, cap, &pos, va_arg(ap, uint32_t), 10, 0);
+                put_uint_pad(buf, cap, &pos, va_arg(ap, uint32_t), 10, 0, width, pad);
                 break;
             case 'x':
             case 'p':
-                put_uint(buf, cap, &pos, va_arg(ap, uint32_t), 16, 0);
+                put_uint_pad(buf, cap, &pos, va_arg(ap, uint32_t), 16, 0, width, pad);
                 break;
             case 'X':
-                put_uint(buf, cap, &pos, va_arg(ap, uint32_t), 16, 1);
+                put_uint_pad(buf, cap, &pos, va_arg(ap, uint32_t), 16, 1, width, pad);
                 break;
             case 'c':
                 put_ch(buf, cap, &pos, (char)va_arg(ap, int));
