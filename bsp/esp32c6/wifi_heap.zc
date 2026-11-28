@@ -1,0 +1,180 @@
+// ZenRTOS 192 KB 16-Byte-Aligned Free-List Heap Allocator in Zen-C
+// Thread-safe & ISR-safe via rtos_irq_save() / rtos_irq_restore().
+
+import "rtos.h" as rtos;
+
+def WIFI_HEAP_SIZE_BYTES: usize = 196608; // 192 * 1024
+def HEAP_ALIGN: usize           = 16;
+def HEAP_MAGIC: u32             = 0x5A454E48; // "ZENH"
+
+struct HeapBlock {
+    magic: u32;
+    size: u32; // Payload size in bytes (excluding header)
+    next: HeapBlock*;
+    used: u32; // 1 = allocated, 0 = free
+}
+
+let g_wifi_heap_arena: u8[196608];
+let g_heap_head: HeapBlock* = (HeapBlock*)0;
+let g_heap_base: usize = 0;
+let g_heap_end: usize  = 0;
+
+@inline
+fn heap_align_up(n: usize) -> usize {
+    return (n + (HEAP_ALIGN - 1)) & ~(HEAP_ALIGN - 1);
+}
+
+fn heap_ensure_init() {
+    if g_heap_head != (HeapBlock*)0 {
+        return;
+    }
+    let raw_base: usize = (usize)&g_wifi_heap_arena[0];
+    let aligned_base: usize = heap_align_up(raw_base);
+    let pad: usize = aligned_base - raw_base;
+    let usable: usize = WIFI_HEAP_SIZE_BYTES - pad;
+
+    g_heap_base = aligned_base;
+    g_heap_end  = aligned_base + usable;
+    g_heap_head = (HeapBlock*)aligned_base;
+    g_heap_head.magic = HEAP_MAGIC;
+    g_heap_head.size  = (u32)(usable - sizeof(HeapBlock));
+    g_heap_head.next  = (HeapBlock*)0;
+    g_heap_head.used  = 0;
+}
+
+@used
+fn wifi_heap_malloc(size_in: usize) -> void* {
+    let size: usize = size_in;
+    if size == 0 {
+        size = 1;
+    }
+    let req: usize = heap_align_up(size);
+
+    let flags: u32 = rtos::rtos_irq_save();
+    heap_ensure_init();
+
+    let hdr_sz: usize = sizeof(HeapBlock);
+    let curr: HeapBlock* = g_heap_head;
+    while curr != (HeapBlock*)0 {
+        if curr.used == 0 && (usize)curr.size >= req {
+            if (usize)curr.size >= req + hdr_sz + HEAP_ALIGN {
+                let split_addr: usize = (usize)curr + hdr_sz + req;
+                let split: HeapBlock* = (HeapBlock*)split_addr;
+                split.magic = HEAP_MAGIC;
+                split.size  = curr.size - (u32)req - (u32)hdr_sz;
+                split.next  = curr.next;
+                split.used  = 0;
+                curr.size   = (u32)req;
+                curr.next   = split;
+            }
+            curr.used = 1;
+            rtos::rtos_irq_restore(flags);
+            return (void*)((usize)curr + hdr_sz);
+        }
+        curr = curr.next;
+    }
+
+    rtos::rtos_irq_restore(flags);
+    return (void*)0;
+}
+
+@used
+fn wifi_heap_calloc(nmemb: usize, size: usize) -> void* {
+    let total: usize = nmemb * size;
+    if nmemb != 0 && (total / nmemb) != size {
+        return (void*)0;
+    }
+    let ptr: void* = wifi_heap_malloc(total);
+    if ptr != (void*)0 {
+        let p: u8* = (u8*)ptr;
+        let i: usize = 0;
+        while i < total {
+            p[i] = (u8)0;
+            i = i + 1;
+        }
+    }
+    return ptr;
+}
+
+@used
+fn wifi_heap_free(ptr: void*) {
+    if ptr == (void*)0 {
+        return;
+    }
+    let hdr_sz: usize = sizeof(HeapBlock);
+    let addr: usize = (usize)ptr;
+    if g_heap_head == (HeapBlock*)0 || addr < g_heap_base + hdr_sz || addr >= g_heap_end {
+        return;
+    }
+
+    let flags: u32 = rtos::rtos_irq_save();
+    let blk: HeapBlock* = (HeapBlock*)(addr - hdr_sz);
+    if blk.magic != HEAP_MAGIC {
+        rtos::rtos_irq_restore(flags);
+        return;
+    }
+    blk.used = 0;
+
+    // Coalesce adjacent free blocks across the list
+    let curr: HeapBlock* = g_heap_head;
+    while curr != (HeapBlock*)0 && curr.next != (HeapBlock*)0 {
+        if curr.used == 0 && curr.next.used == 0 {
+            curr.size = curr.size + (u32)hdr_sz + curr.next.size;
+            curr.next = curr.next.next;
+        } else {
+            curr = curr.next;
+        }
+    }
+    rtos::rtos_irq_restore(flags);
+}
+
+@used
+fn wifi_heap_realloc(ptr: void*, size: usize) -> void* {
+    if ptr == (void*)0 {
+        return wifi_heap_malloc(size);
+    }
+    if size == 0 {
+        wifi_heap_free(ptr);
+        return (void*)0;
+    }
+
+    let hdr_sz: usize = sizeof(HeapBlock);
+    let blk: HeapBlock* = (HeapBlock*)((usize)ptr - hdr_sz);
+    if blk.magic != HEAP_MAGIC {
+        return (void*)0;
+    }
+    if (usize)blk.size >= size {
+        return ptr;
+    }
+
+    let new_ptr: void* = wifi_heap_malloc(size);
+    if new_ptr == (void*)0 {
+        return (void*)0;
+    }
+
+    let dst: u8* = (u8*)new_ptr;
+    let src: u8* = (u8*)ptr;
+    let i: u32 = 0;
+    while i < blk.size {
+        dst[i] = src[i];
+        i = i + 1;
+    }
+    wifi_heap_free(ptr);
+    return new_ptr;
+}
+
+@used
+fn wifi_heap_free_bytes() -> u32 {
+    let flags: u32 = rtos::rtos_irq_save();
+    heap_ensure_init();
+    let total: u32 = 0;
+    let curr: HeapBlock* = g_heap_head;
+    while curr != (HeapBlock*)0 {
+        if curr.used == 0 {
+            total = total + curr.size;
+        }
+        curr = curr.next;
+    }
+    rtos::rtos_irq_restore(flags);
+    return total;
+}

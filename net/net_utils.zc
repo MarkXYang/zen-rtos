@@ -1,0 +1,405 @@
+// ZenNet Phase 3 Network Utilities Suite in Zen-C
+// Implements RFC 1035 DNS A-record resolver, RFC 4330 SNTPv4 UTC clock sync,
+// civil UTC date/time formatter, and RFC 3164 remote UDP syslog client.
+
+import "rtos.h" as rtos;
+
+// ZenNet Core API (net/zen_net.zc)
+extern fn zen_net_is_up() -> bool;
+extern fn zen_net_get_dns() -> u32;
+extern fn zen_ip4_parse(s: char*, out_ip: u32*) -> bool;
+extern fn zen_udp_bind(local_port: u16) -> i32;
+extern fn zen_udp_unbind(slot: i32);
+extern fn zen_udp_slot_port(slot: i32) -> u16;
+extern fn zen_udp_sendto(src_port: u16, dst_ip: u32, dst_port: u16, data: u8*, len: u16) -> i32;
+extern fn zen_udp_recvfrom(slot: i32, buf: u8*, cap: u16,
+                           src_ip: u32*, src_port: u16*, timeout_ms: u32) -> i32;
+
+// Constants
+def DNS_PORT: u16            = 53;
+def SNTP_PORT: u16           = 123;
+def SYSLOG_DEFAULT_PORT: u16 = 514;
+def NTP_UNIX_OFFSET: u32     = 2208988800; // Seconds between 1900-01-01 and 1970-01-01
+def FALLBACK_DNS_IP: u32     = 0x08080808; // 8.8.8.8
+
+// Module State (static buffers to keep task stacks tiny)
+let g_dns_txid: u16 = 0x5A01;
+let g_dns_pkt_buf: u8[300];
+
+let g_utc_synced: bool = false;
+let g_utc_base_epoch: u32 = 0;
+let g_utc_sync_tick_ms: u32 = 0;
+
+let g_syslog_ip: u32 = 0;
+let g_syslog_port: u16 = 514;
+let g_syslog_buf: u8[192];
+
+@inline
+fn u_rd_be16(p: u8*) -> u16 {
+    return ((u16)p[0] << 8) | (u16)p[1];
+}
+
+@inline
+fn u_rd_be32(p: u8*) -> u32 {
+    return ((u32)p[0] << 24) | ((u32)p[1] << 16) | ((u32)p[2] << 8) | (u32)p[3];
+}
+
+@inline
+fn u_wr_be16(p: u8*, v: u16) {
+    p[0] = (u8)(v >> 8);
+    p[1] = (u8)(v & 0xFF);
+}
+
+// ===========================================================================
+// 1. RFC 1035 DNS A-Record Resolver
+// ===========================================================================
+@used
+fn zen_dns_build_query(host: char*, txid: u16, buf: u8*, cap: usize) -> usize {
+    if host == (char*)0 || buf == (u8*)0 || cap < 24 {
+        return 0;
+    }
+    let i: usize = 0;
+    while i < 12 {
+        buf[i] = (u8)0;
+        i = i + 1;
+    }
+    u_wr_be16(&buf[0], txid);
+    u_wr_be16(&buf[2], (u16)0x0100); // Standard query, Recursion Desired (RD=1)
+    u_wr_be16(&buf[4], (u16)1);      // QDCOUNT = 1
+
+    let pos: usize = 12;
+    let hi: usize = 0;
+    while host[hi] != '\0' && host[hi] != ' ' && host[hi] != '\t' && host[hi] != '\r' && host[hi] != '\n' {
+        let len_pos: usize = pos;
+        if pos + 2 >= cap {
+            return 0;
+        }
+        pos = pos + 1;
+        let lbl_len: u32 = 0;
+        while host[hi] != '\0' && host[hi] != '.' && host[hi] != ' ' && host[hi] != '\t' && host[hi] != '\r' && host[hi] != '\n' {
+            if lbl_len >= 63 || pos + 6 >= cap {
+                return 0;
+            }
+            buf[pos] = (u8)host[hi];
+            pos = pos + 1;
+            hi = hi + 1;
+            lbl_len = lbl_len + 1;
+        }
+        if lbl_len == 0 {
+            return 0;
+        }
+        buf[len_pos] = (u8)lbl_len;
+        if host[hi] == '.' {
+            hi = hi + 1;
+        }
+    }
+    if pos == 12 || pos + 5 > cap {
+        return 0;
+    }
+    buf[pos] = (u8)0; // Root label terminator
+    pos = pos + 1;
+    u_wr_be16(&buf[pos], (u16)1);     // QTYPE = A (IPv4)
+    u_wr_be16(&buf[pos + 2], (u16)1); // QCLASS = IN
+    return pos + 4;
+}
+
+fn dns_skip_name(pkt: u8*, len: usize, start: usize) -> usize {
+    let pos: usize = start;
+    let hops: u32 = 0;
+    while pos < len && hops < 128 {
+        let b: u8 = pkt[pos];
+        if b == 0 {
+            return pos + 1;
+        }
+        if (b & 0xC0) == 0xC0 {
+            // Compression pointer (2 bytes)
+            if pos + 2 > len {
+                return len + 1;
+            }
+            return pos + 2;
+        }
+        pos = pos + 1 + (usize)b;
+        hops = hops + 1;
+    }
+    return len + 1;
+}
+
+@used
+fn zen_dns_parse_response(pkt: u8*, len: usize, expect_txid: u16, out_ip: u32*) -> bool {
+    if pkt == (u8*)0 || out_ip == (u32*)0 || len < 12 {
+        return false;
+    }
+    if u_rd_be16(&pkt[0]) != expect_txid {
+        return false;
+    }
+    let flags: u16 = u_rd_be16(&pkt[2]);
+    // Must be Response (QR=1) and RCODE == 0 (No Error)
+    if (flags & 0x8000) == 0 || (flags & 0x000F) != 0 {
+        return false;
+    }
+    let qdcount: u16 = u_rd_be16(&pkt[4]);
+    let ancount: u16 = u_rd_be16(&pkt[6]);
+    if ancount == 0 {
+        return false;
+    }
+
+    let pos: usize = 12;
+    let q: u16 = 0;
+    while q < qdcount {
+        pos = dns_skip_name(pkt, len, pos);
+        if pos + 4 > len {
+            return false;
+        }
+        pos = pos + 4; // QTYPE + QCLASS
+        q = q + (u16)1;
+    }
+
+    let a: u16 = 0;
+    while a < ancount && pos < len {
+        pos = dns_skip_name(pkt, len, pos);
+        if pos + 10 > len {
+            return false;
+        }
+        let rtype: u16  = u_rd_be16(&pkt[pos]);
+        let rclass: u16 = u_rd_be16(&pkt[pos + 2]);
+        let rdlen: u16  = u_rd_be16(&pkt[pos + 8]);
+        pos = pos + 10;
+        if pos + (usize)rdlen > len {
+            return false;
+        }
+        if rtype == 1 && rclass == 1 && rdlen == 4 {
+            *out_ip = u_rd_be32(&pkt[pos]);
+            return true;
+        }
+        pos = pos + (usize)rdlen;
+        a = a + (u16)1;
+    }
+    return false;
+}
+
+@used
+fn zen_dns_resolve(host: char*, out_ip: u32*, timeout_ms: u32) -> bool {
+    if host == (char*)0 || out_ip == (u32*)0 {
+        return false;
+    }
+    // Fast-path: literal dotted-quad IPv4
+    if zen_ip4_parse(host, out_ip) {
+        return true;
+    }
+    if !zen_net_is_up() {
+        return false;
+    }
+
+    let dns_ip: u32 = zen_net_get_dns();
+    if dns_ip == 0 {
+        dns_ip = FALLBACK_DNS_IP;
+    }
+
+    let slot: i32 = zen_udp_bind((u16)0);
+    if slot < 0 {
+        return false;
+    }
+    let local_port: u16 = zen_udp_slot_port(slot);
+
+    let txid: u16 = g_dns_txid;
+    g_dns_txid = g_dns_txid + (u16)1;
+    let qlen: usize = zen_dns_build_query(host, txid, &g_dns_pkt_buf[0], 300);
+    if qlen == 0 {
+        zen_udp_unbind(slot);
+        return false;
+    }
+
+    let per_try_ms: u32 = timeout_ms / 2;
+    if per_try_ms < 250 {
+        per_try_ms = 250;
+    }
+
+    let attempt: u32 = 0;
+    while attempt < 2 {
+        let srv: u32 = dns_ip;
+        if attempt == 1 && dns_ip != FALLBACK_DNS_IP {
+            srv = FALLBACK_DNS_IP;
+        }
+        let _rc: i32 = zen_udp_sendto(local_port, srv, DNS_PORT, &g_dns_pkt_buf[0], (u16)qlen);
+        let src_ip: u32 = 0;
+        let src_port: u16 = 0;
+        let n: i32 = zen_udp_recvfrom(slot, &g_dns_pkt_buf[0], (u16)300, &src_ip, &src_port, per_try_ms);
+        if n >= 12 {
+            if zen_dns_parse_response(&g_dns_pkt_buf[0], (usize)n, txid, out_ip) {
+                zen_udp_unbind(slot);
+                return true;
+            }
+        }
+        // Rebuild query for retry since g_dns_pkt_buf may have been overwritten
+        qlen = zen_dns_build_query(host, txid, &g_dns_pkt_buf[0], 300);
+        attempt = attempt + 1;
+    }
+
+    zen_udp_unbind(slot);
+    return false;
+}
+
+// ===========================================================================
+// 2. RFC 4330 SNTPv4 UTC Clock Sync & Formatter
+// ===========================================================================
+@used
+fn zen_sntp_sync(server_ip: u32, timeout_ms: u32) -> bool {
+    if !zen_net_is_up() || server_ip == 0 {
+        return false;
+    }
+    let slot: i32 = zen_udp_bind((u16)0);
+    if slot < 0 {
+        return false;
+    }
+    let local_port: u16 = zen_udp_slot_port(slot);
+
+    let pkt: u8[48];
+    let i: u32 = 0;
+    while i < 48 {
+        pkt[i] = (u8)0;
+        i = i + 1;
+    }
+    pkt[0] = (u8)0x23; // LI=0, VN=4, Mode=3 (Client)
+
+    let rc: i32 = zen_udp_sendto(local_port, server_ip, SNTP_PORT, &pkt[0], (u16)48);
+    if rc != 0 {
+        zen_udp_unbind(slot);
+        return false;
+    }
+
+    let src_ip: u32 = 0;
+    let src_port: u16 = 0;
+    let n: i32 = zen_udp_recvfrom(slot, &pkt[0], (u16)48, &src_ip, &src_port, timeout_ms);
+    zen_udp_unbind(slot);
+
+    if n < 48 {
+        return false;
+    }
+    let ntp_sec: u32 = u_rd_be32(&pkt[40]);
+    if ntp_sec < NTP_UNIX_OFFSET {
+        return false;
+    }
+
+    g_utc_base_epoch   = ntp_sec - NTP_UNIX_OFFSET;
+    g_utc_sync_tick_ms = rtos::rtos_get_tick();
+    g_utc_synced       = true;
+    return true;
+}
+
+@used
+fn zen_time_is_synced() -> bool {
+    return g_utc_synced;
+}
+
+@used
+fn zen_time_now_utc() -> u32 {
+    if !g_utc_synced {
+        return 0;
+    }
+    let elapsed_s: u32 = (rtos::rtos_get_tick() - g_utc_sync_tick_ms) / 1000;
+    return g_utc_base_epoch + elapsed_s;
+}
+
+fn put_2d(v: u32, buf: char*, pos: usize) {
+    buf[pos]     = (char)((u8)'0' + (u8)((v / 10) % 10));
+    buf[pos + 1] = (char)((u8)'0' + (u8)(v % 10));
+}
+
+@used
+fn zen_time_format_utc(epoch: u32, buf: char*, cap: usize) {
+    if buf == (char*)0 || cap < 24 {
+        return;
+    }
+    let sec_day: u32 = epoch % 86400;
+    let hour: u32    = sec_day / 3600;
+    let minute: u32  = (sec_day % 3600) / 60;
+    let second: u32  = sec_day % 60;
+
+    // Civil date from Unix days (Howard Hinnant algorithm)
+    let z: u32   = (epoch / 86400) + 719468;
+    let era: u32 = z / 146097;
+    let doe: u32 = z - era * 146097;
+    let yoe: u32 = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y: u32   = yoe + era * 400;
+    let doy: u32 = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp: u32  = (5 * doy + 2) / 153;
+    let day: u32 = doy - (153 * mp + 2) / 5 + 1;
+    let month: u32 = mp + 3;
+    if mp >= 10 {
+        month = mp - 9;
+    }
+    if month <= 2 {
+        y = y + 1;
+    }
+
+    // Format "YYYY-MM-DD HH:MM:SS UTC"
+    buf[0]  = (char)((u8)'0' + (u8)((y / 1000) % 10));
+    buf[1]  = (char)((u8)'0' + (u8)((y / 100) % 10));
+    buf[2]  = (char)((u8)'0' + (u8)((y / 10) % 10));
+    buf[3]  = (char)((u8)'0' + (u8)(y % 10));
+    buf[4]  = '-';
+    put_2d(month, buf, 5);
+    buf[7]  = '-';
+    put_2d(day, buf, 8);
+    buf[10] = ' ';
+    put_2d(hour, buf, 11);
+    buf[13] = ':';
+    put_2d(minute, buf, 14);
+    buf[16] = ':';
+    put_2d(second, buf, 17);
+    buf[19] = ' ';
+    buf[20] = 'U';
+    buf[21] = 'T';
+    buf[22] = 'C';
+    buf[23] = '\0';
+}
+
+// ===========================================================================
+// 3. Remote UDP Syslog Client (RFC 3164)
+// ===========================================================================
+@used
+fn zen_syslog_config(server_ip: u32, port: u16) {
+    g_syslog_ip = server_ip;
+    if port != 0 {
+        g_syslog_port = port;
+    } else {
+        g_syslog_port = SYSLOG_DEFAULT_PORT;
+    }
+}
+
+@used
+fn zen_syslog_is_enabled() -> bool {
+    return g_syslog_ip != 0;
+}
+
+@used
+fn zen_syslog_get_ip() -> u32 {
+    return g_syslog_ip;
+}
+
+@used
+fn zen_syslog_get_port() -> u16 {
+    return g_syslog_port;
+}
+
+@used
+fn zen_syslog_send(msg: char*) -> i32 {
+    if g_syslog_ip == 0 || !zen_net_is_up() || msg == (char*)0 {
+        return -1;
+    }
+    let prefix: char* = "<14>ZenRTOS: ";
+    let pos: usize = 0;
+    let i: usize = 0;
+    while prefix[i] != '\0' && pos < 190 {
+        g_syslog_buf[pos] = (u8)prefix[i];
+        pos = pos + 1;
+        i = i + 1;
+    }
+    i = 0;
+    while msg[i] != '\0' && pos < 191 {
+        g_syslog_buf[pos] = (u8)msg[i];
+        pos = pos + 1;
+        i = i + 1;
+    }
+    return zen_udp_sendto((u16)0, g_syslog_ip, g_syslog_port, &g_syslog_buf[0], (u16)pos);
+}

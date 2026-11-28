@@ -1,8 +1,10 @@
-// ZenRTOS ESP32-C6 Wi-Fi & ZenNet Shell Module in Zen-C
-// Implements: wifi [mac|scan|connect|status|disconnect]
+// ZenRTOS ESP32-C6 Wi-Fi & ZenNet Utilities Shell Module in Zen-C
+// Implements: wifi [mac|scan|connect|status|rssi|autoreconnect|disconnect]
 //             ifconfig [dhcp | <ip> <mask> <gw> [dns]]
-//             ping <ip> [count] | arp [flush | probe <ip>] | netstat
-//             udp send <ip> <port> <msg>
+//             ping <host|ip> [count] | nslookup <domain> | ntp [server] | date
+//             arp [flush | probe <ip>] | netstat
+//             udp [send <host|ip> <port> <msg> | listen <port> [sec] | echo <port> [sec]]
+//             syslog [<ip> [port] | send <msg> | off]
 
 import "rtos.h" as rtos;
 
@@ -18,10 +20,11 @@ extern fn wifi_drv_disconnect() -> i32;
 extern fn wifi_drv_get_state() -> i32;
 extern fn wifi_drv_get_ssid() -> char*;
 extern fn wifi_drv_free_heap() -> u32;
-extern fn wifi_drv_sta_input_count() -> u32;
-extern fn wifi_drv_dump_rx_diag();
+extern fn wifi_drv_set_autoreconnect(enable: bool);
+extern fn wifi_drv_get_autoreconnect() -> bool;
+extern fn wifi_drv_get_ap_info(out_rssi: i8*, out_chan: u8*, out_bssid: u8*) -> i32;
 
-// ZenNet Micro-IPv4 API (net/zen_net.zc)
+// ZenNet Core API (net/zen_net.zc)
 struct ShellNetStats {
     rx_frames: u32;
     tx_frames: u32;
@@ -51,10 +54,26 @@ extern fn zen_net_arp_flush();
 extern fn zen_net_arp_probe(ip: u32);
 extern fn zen_net_arp_get_entry(idx: u32, out_ip: u32*, out_mac: u8*, out_age_sec: u32*) -> bool;
 extern fn zen_net_ping(dst_ip: u32, seq: u16, timeout_ms: u32, out_rtt_ms: u32*, out_ttl: u8*) -> bool;
+extern fn zen_udp_bind(local_port: u16) -> i32;
+extern fn zen_udp_unbind(slot: i32);
 extern fn zen_udp_slot_port(slot: i32) -> u16;
 extern fn zen_udp_sendto(src_port: u16, dst_ip: u32, dst_port: u16, data: u8*, len: u16) -> i32;
+extern fn zen_udp_recvfrom(slot: i32, buf: u8*, cap: u16,
+                           src_ip: u32*, src_port: u16*, timeout_ms: u32) -> i32;
 extern fn zen_ip4_parse(s: char*, out_ip: u32*) -> bool;
 extern fn zen_ip4_format(ip: u32, buf: char*, cap: usize);
+
+// ZenNet Phase 3 Utilities API (net/net_utils.zc)
+extern fn zen_dns_resolve(host: char*, out_ip: u32*, timeout_ms: u32) -> bool;
+extern fn zen_sntp_sync(server_ip: u32, timeout_ms: u32) -> bool;
+extern fn zen_time_is_synced() -> bool;
+extern fn zen_time_now_utc() -> u32;
+extern fn zen_time_format_utc(epoch: u32, buf: char*, cap: usize);
+extern fn zen_syslog_config(server_ip: u32, port: u16);
+extern fn zen_syslog_is_enabled() -> bool;
+extern fn zen_syslog_get_ip() -> u32;
+extern fn zen_syslog_get_port() -> u16;
+extern fn zen_syslog_send(msg: char*) -> i32;
 
 fn wifi_put_hex_byte(b: u8) {
     let hex: char* = "0123456789ABCDEF";
@@ -77,6 +96,15 @@ fn wifi_put_ip(ip: u32) {
     let buf: char[16];
     zen_ip4_format(ip, &buf[0], 16);
     bsp_uart_puts(&buf[0]);
+}
+
+fn wifi_put_i32(v: i32) {
+    if v < 0 {
+        bsp_uart_putc('-');
+        bsp_uart_putdec((u32)(0 - v));
+    } else {
+        bsp_uart_putdec((u32)v);
+    }
 }
 
 fn wifi_starts_with(s: char*, prefix: char*) -> bool {
@@ -126,12 +154,41 @@ fn wifi_skip_token(s: char*) -> char* {
     return &s[i];
 }
 
+fn wifi_copy_token(s: char*, dst: char*, cap: u32) -> u32 {
+    let i: u32 = 0;
+    while s[i] != '\0' && s[i] != ' ' && i + 1 < cap {
+        dst[i] = s[i];
+        i = i + 1;
+    }
+    dst[i] = '\0';
+    return i;
+}
+
 fn wifi_print_mac() {
     let mac: u8[6];
     wifi_drv_read_mac(&mac[0]);
     bsp_uart_puts("ESP32-C6 STA MAC   : ");
     wifi_put_mac_raw(&mac[0]);
     bsp_uart_puts("\n");
+}
+
+fn wifi_print_rssi() {
+    let rssi: i8 = 0;
+    let chan: u8 = 0;
+    let bssid: u8[6];
+    if wifi_drv_get_ap_info(&rssi, &chan, &bssid[0]) != 0 {
+        bsp_uart_puts("Wi-Fi is not connected.\n");
+        return;
+    }
+    bsp_uart_puts("AP SSID            : ");
+    bsp_uart_puts(wifi_drv_get_ssid());
+    bsp_uart_puts("\nAP BSSID           : ");
+    wifi_put_mac_raw(&bssid[0]);
+    bsp_uart_puts("\nChannel            : ");
+    bsp_uart_putdec((u32)chan);
+    bsp_uart_puts("\nRSSI               : ");
+    wifi_put_i32((i32)rssi);
+    bsp_uart_puts(" dBm\n");
 }
 
 fn wifi_print_status() {
@@ -162,10 +219,15 @@ fn wifi_print_status() {
         wifi_put_ip(zen_net_get_ip());
         bsp_uart_puts("\n");
     }
+    bsp_uart_puts("Auto-Reconnect     : ");
+    if wifi_drv_get_autoreconnect() {
+        bsp_uart_puts("ON\n");
+    } else {
+        bsp_uart_puts("OFF\n");
+    }
     bsp_uart_puts("Wi-Fi Heap Free    : ");
     bsp_uart_putdec(wifi_drv_free_heap());
     bsp_uart_puts(" B\n");
-    wifi_drv_dump_rx_diag();
 }
 
 fn cmd_ifconfig(cmd: char*) {
@@ -211,6 +273,16 @@ fn cmd_ifconfig(cmd: char*) {
     if ssid[0] != '\0' {
         bsp_uart_puts(" (SSID: ");
         bsp_uart_puts(ssid);
+        let rssi: i8 = 0;
+        let chan: u8 = 0;
+        let bssid: u8[6];
+        if wifi_drv_get_ap_info(&rssi, &chan, &bssid[0]) == 0 {
+            bsp_uart_puts(", Ch ");
+            bsp_uart_putdec((u32)chan);
+            bsp_uart_puts(", ");
+            wifi_put_i32((i32)rssi);
+            bsp_uart_puts(" dBm");
+        }
         bsp_uart_puts(")");
     }
     bsp_uart_puts("\n          HWaddr: ");
@@ -312,15 +384,101 @@ fn cmd_netstat() {
     bsp_uart_puts("\n");
 }
 
+fn cmd_nslookup(cmd: char*) {
+    if !zen_net_is_up() {
+        bsp_uart_puts("Network interface is DOWN.\n");
+        return;
+    }
+    let host: char[64];
+    if wifi_copy_token(&cmd[9], &host[0], 64) == 0 {
+        bsp_uart_puts("Usage: nslookup <domain>\n");
+        return;
+    }
+    bsp_uart_puts("Server:  ");
+    let dns: u32 = zen_net_get_dns();
+    if dns == 0 { dns = 0x08080808; }
+    wifi_put_ip(dns);
+    bsp_uart_puts("\n");
+
+    let ip: u32 = 0;
+    if zen_dns_resolve(&host[0], &ip, 2000) {
+        bsp_uart_puts("Address: ");
+        bsp_uart_puts(&host[0]);
+        bsp_uart_puts(" -> ");
+        wifi_put_ip(ip);
+        bsp_uart_puts("\n");
+    } else {
+        bsp_uart_puts("DNS lookup failed for '");
+        bsp_uart_puts(&host[0]);
+        bsp_uart_puts("'\n");
+    }
+}
+
+fn cmd_ntp(cmd: char*) {
+    if !zen_net_is_up() {
+        bsp_uart_puts("Network interface is DOWN.\n");
+        return;
+    }
+    let host: char[64];
+    if cmd[3] == ' ' && wifi_copy_token(&cmd[4], &host[0], 64) > 0 {
+        // User-specified NTP server
+    } else {
+        let def_srv: char* = "pool.ntp.org";
+        let i: u32 = 0;
+        while def_srv[i] != '\0' {
+            host[i] = def_srv[i];
+            i = i + 1;
+        }
+        host[i] = '\0';
+    }
+
+    let ip: u32 = 0;
+    if !zen_dns_resolve(&host[0], &ip, 2000) {
+        bsp_uart_puts("[ntp] Failed to resolve '");
+        bsp_uart_puts(&host[0]);
+        bsp_uart_puts("'\n");
+        return;
+    }
+    if zen_sntp_sync(ip, 2000) {
+        let ts: char[28];
+        zen_time_format_utc(zen_time_now_utc(), &ts[0], 28);
+        bsp_uart_puts("[ntp] Synced via ");
+        wifi_put_ip(ip);
+        bsp_uart_puts(": ");
+        bsp_uart_puts(&ts[0]);
+        bsp_uart_puts("\n");
+    } else {
+        bsp_uart_puts("[ntp] SNTP request timed out.\n");
+    }
+}
+
+fn cmd_date() {
+    if !zen_time_is_synced() {
+        bsp_uart_puts("UTC clock not synced yet (run 'ntp' first).\n");
+        return;
+    }
+    let ts: char[28];
+    zen_time_format_utc(zen_time_now_utc(), &ts[0], 28);
+    bsp_uart_puts(&ts[0]);
+    bsp_uart_puts("\n");
+}
+
 fn cmd_ping(cmd: char*) {
     if !zen_net_is_up() {
         bsp_uart_puts("Network interface is DOWN (connect to Wi-Fi and wait for DHCP).\n");
         return;
     }
-    let ip: u32 = 0;
     let arg: char* = &cmd[5];
-    if !zen_ip4_parse(arg, &ip) {
-        bsp_uart_puts("Usage: ping <ipv4> [count]\n");
+    let host: char[64];
+    if wifi_copy_token(arg, &host[0], 64) == 0 {
+        bsp_uart_puts("Usage: ping <host|ipv4> [count]\n");
+        return;
+    }
+    let ip: u32 = 0;
+    if !zen_dns_resolve(&host[0], &ip, 2000) {
+        bsp_uart_puts("Could not resolve host '");
+        bsp_uart_puts(&host[0]);
+        bsp_uart_puts("'\n");
         return;
     }
     let count: u32 = 4;
@@ -333,8 +491,10 @@ fn cmd_ping(cmd: char*) {
     }
 
     bsp_uart_puts("PING ");
+    bsp_uart_puts(&host[0]);
+    bsp_uart_puts(" (");
     wifi_put_ip(ip);
-    bsp_uart_puts(": 32 data bytes\n");
+    bsp_uart_puts("): 32 data bytes\n");
 
     let rx_ok: u32 = 0;
     let rtt_min: u32 = 0xFFFFFFFF;
@@ -392,9 +552,84 @@ fn cmd_ping(cmd: char*) {
     bsp_uart_puts(" ---\n");
 }
 
+fn cmd_udp_listen_or_echo(arg: char*, do_echo: bool) {
+    if !zen_net_is_up() {
+        bsp_uart_puts("Network interface is DOWN.\n");
+        return;
+    }
+    let port: u32 = 0;
+    if !wifi_parse_u32(arg, &port) || port == 0 || port > 65535 {
+        bsp_uart_puts("Usage: udp listen|echo <port> [timeout_s]\n");
+        return;
+    }
+    let timeout_s: u32 = 10;
+    let t_arg: char* = wifi_skip_token(arg);
+    if t_arg[0] != '\0' {
+        let parsed: u32 = 0;
+        if wifi_parse_u32(t_arg, &parsed) && parsed > 0 && parsed <= 120 {
+            timeout_s = parsed;
+        }
+    }
+
+    let slot: i32 = zen_udp_bind((u16)port);
+    if slot < 0 {
+        bsp_uart_puts("UDP bind failed (no free socket slots).\n");
+        return;
+    }
+
+    if do_echo {
+        bsp_uart_puts("UDP echo service on :");
+    } else {
+        bsp_uart_puts("Listening on UDP :");
+    }
+    bsp_uart_putdec(port);
+    bsp_uart_puts(" for ");
+    bsp_uart_putdec(timeout_s);
+    bsp_uart_puts("s...\n");
+
+    let end_ms: u32 = rtos::rtos_get_tick() + timeout_s * 1000;
+    let rx_buf: u8[256];
+    let count: u32 = 0;
+    while (i32)(end_ms - rtos::rtos_get_tick()) > 0 {
+        let rem: u32 = end_ms - rtos::rtos_get_tick();
+        if rem > 500 { rem = 500; }
+        let src_ip: u32 = 0;
+        let src_port: u16 = 0;
+        let n: i32 = zen_udp_recvfrom(slot, &rx_buf[0], (u16)255, &src_ip, &src_port, rem);
+        if n > 0 {
+            rx_buf[n] = (u8)0;
+            bsp_uart_puts("  [");
+            wifi_put_ip(src_ip);
+            bsp_uart_putc(':');
+            bsp_uart_putdec((u32)src_port);
+            bsp_uart_puts("] (");
+            bsp_uart_putdec((u32)n);
+            bsp_uart_puts(" B): ");
+            bsp_uart_puts((char*)&rx_buf[0]);
+            bsp_uart_puts("\n");
+            if do_echo {
+                let _rc: i32 = zen_udp_sendto((u16)port, src_ip, src_port, &rx_buf[0], (u16)n);
+            }
+            count = count + 1;
+        }
+    }
+    zen_udp_unbind(slot);
+    bsp_uart_puts("Done (");
+    bsp_uart_putdec(count);
+    bsp_uart_puts(" packets received).\n");
+}
+
 fn cmd_udp(cmd: char*) {
+    if wifi_starts_with(cmd, "udp listen ") {
+        cmd_udp_listen_or_echo(&cmd[11], false);
+        return;
+    }
+    if wifi_starts_with(cmd, "udp echo ") {
+        cmd_udp_listen_or_echo(&cmd[9], true);
+        return;
+    }
     if !wifi_starts_with(cmd, "udp send ") {
-        bsp_uart_puts("Usage: udp send <ipv4> <port> <message>\n");
+        bsp_uart_puts("Usage: udp [send <host|ip> <port> <msg> | listen <port> [sec] | echo <port> [sec]]\n");
         return;
     }
     if !zen_net_is_up() {
@@ -402,9 +637,10 @@ fn cmd_udp(cmd: char*) {
         return;
     }
     let p_ip: char* = &cmd[9];
+    let host: char[64];
     let dst_ip: u32 = 0;
-    if !zen_ip4_parse(p_ip, &dst_ip) {
-        bsp_uart_puts("Invalid IPv4 address.\n");
+    if wifi_copy_token(p_ip, &host[0], 64) == 0 || !zen_dns_resolve(&host[0], &dst_ip, 2000) {
+        bsp_uart_puts("Could not resolve target host.\n");
         return;
     }
     let p_port: char* = wifi_skip_token(p_ip);
@@ -419,7 +655,7 @@ fn cmd_udp(cmd: char*) {
         mlen = mlen + 1;
     }
     if mlen == 0 {
-        bsp_uart_puts("Usage: udp send <ipv4> <port> <message>\n");
+        bsp_uart_puts("Usage: udp send <host|ip> <port> <message>\n");
         return;
     }
     let rc: i32 = zen_udp_sendto((u16)0, dst_ip, (u16)port, (u8*)msg, (u16)mlen);
@@ -434,6 +670,54 @@ fn cmd_udp(cmd: char*) {
     } else {
         bsp_uart_puts("UDP send failed.\n");
     }
+}
+
+fn cmd_syslog(cmd: char*) {
+    if cmd[6] == '\0' {
+        if zen_syslog_is_enabled() {
+            bsp_uart_puts("Syslog target: ");
+            wifi_put_ip(zen_syslog_get_ip());
+            bsp_uart_putc(':');
+            bsp_uart_putdec((u32)zen_syslog_get_port());
+            bsp_uart_puts("\n");
+        } else {
+            bsp_uart_puts("Syslog is OFF (usage: syslog <ip> [port] | syslog send <msg> | syslog off)\n");
+        }
+        return;
+    }
+    if wifi_starts_with(cmd, "syslog off") {
+        zen_syslog_config(0, (u16)514);
+        bsp_uart_puts("Remote UDP syslog disabled.\n");
+        return;
+    }
+    if wifi_starts_with(cmd, "syslog send ") {
+        if zen_syslog_send(&cmd[12]) == 0 {
+            bsp_uart_puts("Syslog message sent.\n");
+        } else {
+            bsp_uart_puts("Syslog send failed (configure target IP first).\n");
+        }
+        return;
+    }
+    let ip: u32 = 0;
+    let arg: char* = &cmd[7];
+    if !zen_ip4_parse(arg, &ip) {
+        bsp_uart_puts("Usage: syslog <ip> [port] | syslog send <msg> | syslog off\n");
+        return;
+    }
+    let port: u32 = 514;
+    let p_arg: char* = wifi_skip_token(arg);
+    if p_arg[0] != '\0' {
+        let parsed: u32 = 0;
+        if wifi_parse_u32(p_arg, &parsed) && parsed > 0 && parsed <= 65535 {
+            port = parsed;
+        }
+    }
+    zen_syslog_config(ip, (u16)port);
+    bsp_uart_puts("Remote UDP syslog enabled -> ");
+    wifi_put_ip(ip);
+    bsp_uart_putc(':');
+    bsp_uart_putdec(port);
+    bsp_uart_puts("\n");
 }
 
 // Exported hook called by bsp/esp32c6/esp32c6.zc zensh> shell
@@ -451,12 +735,28 @@ fn bsp_wifi_shell_cmd(cmd: char*) -> bool {
         cmd_netstat();
         return true;
     }
+    if wifi_starts_with(cmd, "nslookup ") {
+        cmd_nslookup(cmd);
+        return true;
+    }
+    if wifi_starts_with(cmd, "ntp") && (cmd[3] == '\0' || cmd[3] == ' ') {
+        cmd_ntp(cmd);
+        return true;
+    }
+    if wifi_starts_with(cmd, "date") && (cmd[4] == '\0' || cmd[4] == ' ') {
+        cmd_date();
+        return true;
+    }
     if wifi_starts_with(cmd, "ping ") {
         cmd_ping(cmd);
         return true;
     }
     if wifi_starts_with(cmd, "udp") && (cmd[3] == '\0' || cmd[3] == ' ') {
         cmd_udp(cmd);
+        return true;
+    }
+    if wifi_starts_with(cmd, "syslog") && (cmd[6] == '\0' || cmd[6] == ' ') {
+        cmd_syslog(cmd);
         return true;
     }
 
@@ -469,6 +769,19 @@ fn bsp_wifi_shell_cmd(cmd: char*) -> bool {
 
     if wifi_starts_with(cmd, "wifi mac") {
         wifi_print_mac();
+    } else if wifi_starts_with(cmd, "wifi rssi") {
+        wifi_print_rssi();
+    } else if wifi_starts_with(cmd, "wifi autoreconnect") {
+        if wifi_starts_with(cmd, "wifi autoreconnect on") {
+            wifi_drv_set_autoreconnect(true);
+            bsp_uart_puts("Wi-Fi auto-reconnect ENABLED.\n");
+        } else if wifi_starts_with(cmd, "wifi autoreconnect off") {
+            wifi_drv_set_autoreconnect(false);
+            bsp_uart_puts("Wi-Fi auto-reconnect DISABLED.\n");
+        } else {
+            bsp_uart_puts("Wi-Fi auto-reconnect is ");
+            if wifi_drv_get_autoreconnect() { bsp_uart_puts("ON\n"); } else { bsp_uart_puts("OFF\n"); }
+        }
     } else if wifi_starts_with(cmd, "wifi status") || cmd[4] == '\0' {
         wifi_print_status();
     } else if wifi_starts_with(cmd, "wifi scan") {
@@ -516,7 +829,7 @@ fn bsp_wifi_shell_cmd(cmd: char*) -> bool {
         let _err: i32 = wifi_drv_disconnect();
         bsp_uart_puts("Wi-Fi disconnected.\n");
     } else {
-        bsp_uart_puts("Usage: wifi [mac | scan | connect <ssid> [pass] | status | disconnect]\n");
+        bsp_uart_puts("Usage: wifi [mac | scan | connect <ssid> [pass] | status | rssi | autoreconnect [on|off] | disconnect]\n");
     }
     return true;
 }

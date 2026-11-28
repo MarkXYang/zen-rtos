@@ -5,6 +5,7 @@
 #include "rtos.h"
 #include "wifi_wpa2.h"
 #include "zen_net.h"
+#include "zen_net_utils.h"
 
 void bsp_uart_puts(const char *s) { (void)s; }
 
@@ -643,6 +644,58 @@ static void test_zen_net_icmp_and_udp(void) {
     printf("          ICMPv4 Echo Reply & 4-slot UDP bind/recvfrom/sendto verified. [PASS]\n");
 }
 
+// -------------------------------------------------------------------------
+// Test 16: ZenNet Phase 3 Utilities (DNS RFC 1035 & SNTP UTC Formatting)
+// -------------------------------------------------------------------------
+static void test_zen_net_utils_dns_and_sntp(void) {
+    printf("[TEST 16] Verifying ZenNet DNS query/response & SNTP UTC formatter...\n");
+
+    // 1. Build RFC 1035 DNS A-record query for "pool.ntp.org"
+    uint8_t q[128];
+    size_t qlen = zen_dns_build_query("pool.ntp.org", 0x1234, q, sizeof(q));
+    assert(qlen == 12 + 14 + 4);
+    assert(q[0] == 0x12 && q[1] == 0x34);
+    assert(q[12] == 4 && memcmp(q + 13, "pool", 4) == 0);
+    assert(q[17] == 3 && memcmp(q + 18, "ntp", 3) == 0);
+    assert(q[21] == 3 && memcmp(q + 22, "org", 3) == 0);
+    assert(q[25] == 0);
+
+    // 2. Build mock DNS response with compressed pointer (0xC0 0x0C) -> 162.159.200.1
+    uint8_t resp[128];
+    memcpy(resp, q, qlen);
+    resp[2] = 0x81; resp[3] = 0x80; // QR=1, RD=1, RA=1, RCODE=0
+    resp[6] = 0x00; resp[7] = 0x01; // ANCOUNT=1
+    uint8_t ans[16] = {
+        0xC0, 0x0C,             // Name pointer to offset 12
+        0x00, 0x01,             // TYPE = A
+        0x00, 0x01,             // CLASS = IN
+        0x00, 0x00, 0x00, 0x3C, // TTL = 60s
+        0x00, 0x04,             // RDLENGTH = 4
+        162, 159, 200, 1        // 162.159.200.1
+    };
+    memcpy(resp + qlen, ans, sizeof(ans));
+    uint32_t resolved_ip = 0;
+    assert(zen_dns_parse_response(resp, qlen + sizeof(ans), 0x1234, &resolved_ip));
+    assert(resolved_ip == 0xA29FC801U);
+    assert(!zen_dns_parse_response(resp, qlen + sizeof(ans), 0x9999, &resolved_ip));
+
+    // 3. Civil UTC timestamp formatter verification (known Unix epochs)
+    char ts[32];
+    zen_time_format_utc(0U, ts, sizeof(ts));
+    assert(strcmp(ts, "1970-01-01 00:00:00 UTC") == 0);
+    zen_time_format_utc(1709164800U, ts, sizeof(ts)); // 2024-02-29 00:00:00 UTC (leap day!)
+    assert(strcmp(ts, "2024-02-29 00:00:00 UTC") == 0);
+
+    // 4. Syslog config & send check (while ZenNet is up from Test 14/15)
+    zen_syslog_config(0xC0A80101U, 514);
+    assert(zen_syslog_is_enabled() && zen_syslog_get_port() == 514);
+    assert(zen_syslog_send("Phase3-OK") == 0);
+    zen_syslog_config(0, 514);
+    assert(!zen_syslog_is_enabled());
+
+    printf("          DNS RFC 1035, SNTP UTC leap-year formatter & UDP syslog verified. [PASS]\n");
+}
+
 int main(void) {
     printf("====================================================\n");
     printf("      ZenRTOS Host Verification Test Suite         \n");
@@ -663,9 +716,10 @@ int main(void) {
     test_wpa2_crypto_vectors();
     test_zen_net_arp_and_dhcp();
     test_zen_net_icmp_and_udp();
+    test_zen_net_utils_dns_and_sntp();
 
     printf("====================================================\n");
-    printf("  ALL 15 UNIT TESTS PASSED SUCCESSFULLY! (100%%)     \n");
+    printf("  ALL 16 UNIT TESTS PASSED SUCCESSFULLY! (100%%)     \n");
     printf("====================================================\n");
     return 0;
 }

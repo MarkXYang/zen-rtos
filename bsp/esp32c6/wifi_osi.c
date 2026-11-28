@@ -15,9 +15,27 @@
 #include "zen_net.h"
 
 static rtos_timer_t s_net_tick_timer;
+static volatile bool     g_autoreconnect    = true;
+static volatile bool     g_user_disconnect  = false;
+static volatile uint32_t g_reconn_next_ms   = 0;
+static volatile uint32_t g_reconn_delay_ms  = 1000;
+extern esp_err_t esp_wifi_connect_internal(void);
+extern void      bsp_uart_puts(const char *s);
+static volatile int32_t  g_wifi_state;
+static char g_wifi_ssid[33];
+
 static void wifi_net_tick_cb(void *arg) {
     (void)arg;
-    zen_net_tick(rtos_get_tick());
+    uint32_t now = rtos_get_tick();
+    zen_net_tick(now);
+    if (g_autoreconnect && !g_user_disconnect && g_wifi_state == 1 &&
+        g_wifi_ssid[0] != '\0' && g_reconn_next_ms != 0 &&
+        (int32_t)(now - g_reconn_next_ms) >= 0) {
+        g_reconn_next_ms = 0;
+        g_wifi_state = 3;
+        bsp_uart_puts("[wifi] Auto-reconnecting...\n");
+        (void)esp_wifi_connect_internal();
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -726,10 +744,9 @@ static int32_t osi_event_post(const char *base, int32_t id, void *data, size_t l
         g_wifi_state = 1;
     } else if (id == 4) {
         g_wifi_state = 4;
-        uint32_t rxcb_val = *(volatile uint32_t *)0x4087ff8cUL;
-        char dbg[72];
-        snprintf(dbg, sizeof(dbg), "[wifi] Connected to AP (L2 link UP, rxcb=0x%08x)\n", (unsigned)rxcb_val);
-        bsp_uart_puts(dbg);
+        g_reconn_next_ms = 0;
+        g_reconn_delay_ms = 1000;
+        bsp_uart_puts("[wifi] Connected to AP (L2 link UP)\n");
         if (s_l2_link_cb) s_l2_link_cb(true);
     } else if (id == 5) {
         g_wifi_state = 1;
@@ -742,6 +759,13 @@ static int32_t osi_event_post(const char *base, int32_t id, void *data, size_t l
         snprintf(msg, sizeof(msg), "[wifi] Disconnected from AP (reason=%u)\n", (unsigned)reason);
         bsp_uart_puts(msg);
         if (s_l2_link_cb) s_l2_link_cb(false);
+        if (g_autoreconnect && !g_user_disconnect && g_wifi_ssid[0] != '\0') {
+            g_reconn_next_ms = rtos_get_tick() + g_reconn_delay_ms;
+            if (g_reconn_delay_ms < 10000U) {
+                g_reconn_delay_ms *= 2U;
+                if (g_reconn_delay_ms > 10000U) g_reconn_delay_ms = 10000U;
+            }
+        }
     }
     return 0;
 }
@@ -1177,14 +1201,40 @@ int32_t wifi_drv_connect(const char *ssid, const char *pass) {
     err = esp_wifi_set_config(WIFI_IF_STA, &wcfg);
     if (err != 0) return err;
 
+    g_user_disconnect = false;
+    g_reconn_next_ms  = 0;
+    g_reconn_delay_ms = 1000;
     g_wifi_state = 3;
     return esp_wifi_connect_internal();
 }
 
 int32_t wifi_drv_disconnect(void) {
     if (g_wifi_state == 0) return 0;
+    g_user_disconnect = true;
+    g_reconn_next_ms  = 0;
     g_wifi_state = 1;
     return esp_wifi_disconnect_internal();
+}
+
+void wifi_drv_set_autoreconnect(bool enable) {
+    g_autoreconnect = enable;
+    if (!enable) g_reconn_next_ms = 0;
+}
+
+bool wifi_drv_get_autoreconnect(void) {
+    return g_autoreconnect;
+}
+
+int32_t wifi_drv_get_ap_info(int8_t *out_rssi, uint8_t *out_chan, uint8_t out_bssid[6]) {
+    if (g_wifi_state != 4) return -1;
+    wifi_ap_record_t ap;
+    memset(&ap, 0, sizeof(ap));
+    esp_err_t err = esp_wifi_sta_get_ap_info(&ap);
+    if (err != 0) return (int32_t)err;
+    if (out_rssi) *out_rssi = ap.rssi;
+    if (out_chan) *out_chan = ap.primary;
+    if (out_bssid) memcpy(out_bssid, ap.bssid, 6U);
+    return 0;
 }
 
 int32_t wifi_drv_get_state(void) { return g_wifi_state; }
