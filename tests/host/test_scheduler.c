@@ -3,6 +3,7 @@
 #include <string.h>
 #include <assert.h>
 #include "rtos.h"
+#include "wifi_wpa2.h"
 
 // Access internal kernel state for unit verification
 extern volatile tcb_t *current_tcb;
@@ -398,6 +399,57 @@ static void test_software_timers_and_isr_sem(void) {
     printf("          One-shot/periodic timers & ISR sem verified. [PASS]\n");
 }
 
+// -------------------------------------------------------------------------
+// Test 13: WPA2-PSK Crypto (IEEE 802.11i PBKDF2-SHA1 & RFC 3394 AES Unwrap)
+// -------------------------------------------------------------------------
+static void test_wpa2_crypto_vectors(void) {
+    printf("[TEST 13] Verifying IEEE 802.11i PBKDF2-SHA1 & RFC 3394 AES-128 Unwrap...\n");
+
+    // Official IEEE 802.11i-2004 Annex H.4 test vector: passphrase="password", SSID="IEEE"
+    static const uint8_t expected_pmk[32] = {
+        0xf4, 0x2c, 0x6f, 0xc5, 0x2d, 0xf0, 0xeb, 0xef,
+        0x9e, 0xbb, 0x4b, 0x90, 0xb3, 0x8a, 0x5f, 0x90,
+        0x2e, 0x83, 0xfe, 0x1b, 0x13, 0x5a, 0x70, 0xe2,
+        0x3a, 0xed, 0x76, 0x2e, 0x97, 0x10, 0xa1, 0x2e
+    };
+    uint8_t pmk[32];
+    wpa2_pbkdf2_sha1("password", (const uint8_t *)"IEEE", 4, 4096, pmk, 32);
+    assert(memcmp(pmk, expected_pmk, 32) == 0);
+
+    // Official RFC 3394 Section 4.1 (128-bit KEK, 128-bit Key Data)
+    static const uint8_t kek[16] = {
+        0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+        0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F
+    };
+    static const uint8_t cipher[24] = {
+        0x1F, 0xA6, 0x8B, 0x0A, 0x81, 0x12, 0xB4, 0x47,
+        0xAE, 0xF3, 0x4B, 0xD8, 0xFB, 0x5A, 0x7B, 0x82,
+        0x9D, 0x3E, 0x86, 0x23, 0x71, 0xD2, 0xCF, 0xE5
+    };
+    static const uint8_t expected_plain[16] = {
+        0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
+        0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF
+    };
+    uint8_t plain[16];
+    assert(wpa2_aes_unwrap(kek, 2, cipher, plain) == 0);
+    assert(memcmp(plain, expected_plain, 16) == 0);
+
+    // Corrupted ciphertext must fail integrity check (IV != 0xA6..A6)
+    uint8_t bad_cipher[24];
+    memcpy(bad_cipher, cipher, 24);
+    bad_cipher[0] ^= 0x01;
+    assert(wpa2_aes_unwrap(kek, 2, bad_cipher, plain) != 0);
+
+    // PRF-384 determinism check
+    uint8_t ptk1[48], ptk2[48];
+    uint8_t seed[16] = {1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16};
+    wpa2_prf_384(pmk, "Pairwise key expansion", seed, sizeof(seed), ptk1);
+    wpa2_prf_384(pmk, "Pairwise key expansion", seed, sizeof(seed), ptk2);
+    assert(memcmp(ptk1, ptk2, 48) == 0);
+
+    printf("          PBKDF2-SHA1 (IEEE 802.11i), AES-128 Unwrap (RFC 3394) & PRF-384 verified. [PASS]\n");
+}
+
 int main(void) {
     printf("====================================================\n");
     printf("      ZenRTOS Host Verification Test Suite         \n");
@@ -415,9 +467,10 @@ int main(void) {
     test_sem_and_mutex_timeouts();
     test_round_robin_and_task_delete();
     test_software_timers_and_isr_sem();
+    test_wpa2_crypto_vectors();
 
     printf("====================================================\n");
-    printf("  ALL 12 UNIT TESTS PASSED SUCCESSFULLY! (100%%)     \n");
+    printf("  ALL 13 UNIT TESTS PASSED SUCCESSFULLY! (100%%)     \n");
     printf("====================================================\n");
     return 0;
 }

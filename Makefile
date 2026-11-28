@@ -7,7 +7,7 @@ CLANG         ?= clang
 LLVM_OBJCOPY  ?= llvm-objcopy
 
 CC_HOST       ?= gcc
-CFLAGS_HOST   ?= -Wall -Wextra -O2 -Ikernel/include -DRTOS_HOST_TEST
+CFLAGS_HOST   ?= -Wall -Wextra -O2 -Ikernel/include -Ibsp/esp32c6 -DRTOS_HOST_TEST
 
 # ARM Target Flags (Clang bare-metal)
 TARGET_TRIPLE ?= arm-none-eabi
@@ -103,7 +103,7 @@ test: $(BUILD_DIR)/test_scheduler
 	@echo "--- Executing ZenRTOS Host Test Suite ---"
 	@./$(BUILD_DIR)/test_scheduler
 
-$(BUILD_DIR)/test_scheduler: tests/host/test_scheduler.c kernel/rtos.c
+$(BUILD_DIR)/test_scheduler: tests/host/test_scheduler.c kernel/rtos.c bsp/esp32c6/wifi_wpa2.c
 	@mkdir -p $(BUILD_DIR)
 	$(CC_HOST) $(CFLAGS_HOST) $^ -o $@
 
@@ -184,6 +184,7 @@ $(BUILD_DIR)/zen_rtos_esp32c6_wifi.elf: kernel/rtos.c \
                                         bsp/esp32c6/startup.s \
                                         bsp/esp32c6/wifi_heap.c \
                                         bsp/esp32c6/wifi_libc.c \
+                                        bsp/esp32c6/wifi_wpa2.c \
                                         bsp/esp32c6/wifi_osi.c \
                                         bsp/esp32c6/link_wifi.ld \
                                         $(BUILD_DIR)/esp32c6_zc.c \

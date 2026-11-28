@@ -11,6 +11,7 @@
 #include "esp_wifi.h"
 #include "phy.h"
 #include "phy_init_data.h"
+#include "wifi_wpa2.h"
 
 // ---------------------------------------------------------------------------
 // External ZenRTOS, ROM & BSP Helpers
@@ -650,15 +651,72 @@ static int  osi_get_time(void *t) {
 }
 static uint32_t osi_slowclk_cal_get(void) { return 28633U; }
 
-// Wi-Fi event tracking for zensh> status
-static volatile int32_t g_wifi_state = 0; // 0=UNINIT, 1=IDLE, 2=SCANNING, 3=CONNECTING, 4=CONNECTED
+// Wi-Fi event & L2 Ethernet II bridge tracking (used by zensh> & Phase 2 ZenNet)
+typedef esp_err_t (*wifi_rxcb_t)(void *buffer, uint16_t len, void *eb);
+typedef void (*wifi_l2_rx_fn_t)(const uint8_t *frame, uint16_t len);
+typedef void (*wifi_l2_link_fn_t)(bool up);
+
+extern esp_err_t esp_wifi_internal_reg_rxcb(wifi_interface_t ifx, wifi_rxcb_t fn);
+extern esp_err_t esp_wifi_internal_tx(wifi_interface_t ifx, void *buffer, uint16_t len);
+extern void      esp_wifi_internal_free_rx_buffer(void *buffer);
+
+static volatile int32_t  g_wifi_state = 0; // 0=UNINIT, 1=IDLE, 2=SCANNING, 3=CONNECTING, 4=CONNECTED
+static volatile uint32_t g_l2_rx_frames = 0;
+static volatile uint32_t g_l2_tx_frames = 0;
+static wifi_l2_rx_fn_t   s_l2_rx_cb   = NULL;
+static wifi_l2_link_fn_t s_l2_link_cb = NULL;
+
+static esp_err_t wifi_l2_rx_trampoline(void *buffer, uint16_t len, void *eb) {
+    if (buffer && len >= 14U) {
+        g_l2_rx_frames++;
+        if (s_l2_rx_cb) {
+            s_l2_rx_cb((const uint8_t *)buffer, len);
+        }
+    }
+    if (eb) {
+        esp_wifi_internal_free_rx_buffer(eb);
+    }
+    return 0;
+}
+
+void wifi_drv_set_l2_callbacks(wifi_l2_rx_fn_t rx_cb, wifi_l2_link_fn_t link_cb) {
+    s_l2_rx_cb   = rx_cb;
+    s_l2_link_cb = link_cb;
+}
+
+int32_t wifi_drv_eth_tx(const uint8_t *frame, uint16_t len) {
+    if (!frame || len < 14U || g_wifi_state != 4) return -1;
+    esp_err_t err = esp_wifi_internal_tx(WIFI_IF_STA, (void *)frame, len);
+    if (err == 0) g_l2_tx_frames++;
+    return (int32_t)err;
+}
+
+uint32_t wifi_drv_l2_rx_count(void) { return g_l2_rx_frames; }
+uint32_t wifi_drv_l2_tx_count(void) { return g_l2_tx_frames; }
 
 static int32_t osi_event_post(const char *base, int32_t id, void *data, size_t len, uint32_t wait) {
-    (void)base; (void)data; (void)len; (void)wait;
+    (void)base; (void)wait;
     // WIFI_EVENT_STA_START=2, CONNECTED=4, DISCONNECTED=5, SCAN_DONE=1
-    if (id == 2 || id == 1) g_wifi_state = 1;
-    else if (id == 4)       g_wifi_state = 4;
-    else if (id == 5)       g_wifi_state = 1;
+    if (id == 2 || id == 1) {
+        g_wifi_state = 1;
+    } else if (id == 4) {
+        g_wifi_state = 4;
+        (void)esp_wifi_internal_reg_rxcb(WIFI_IF_STA, wifi_l2_rx_trampoline);
+        bsp_uart_puts("[wifi] Connected to AP (L2 link UP)\n");
+        if (s_l2_link_cb) s_l2_link_cb(true);
+    } else if (id == 5) {
+        g_wifi_state = 1;
+        (void)esp_wifi_internal_reg_rxcb(WIFI_IF_STA, NULL);
+        wifi_wpa2_reset();
+        uint8_t reason = 0;
+        if (data && len >= sizeof(wifi_event_sta_disconnected_t)) {
+            reason = ((const wifi_event_sta_disconnected_t *)data)->reason;
+        }
+        char msg[64];
+        snprintf(msg, sizeof(msg), "[wifi] Disconnected from AP (reason=%u)\n", (unsigned)reason);
+        bsp_uart_puts(msg);
+        if (s_l2_link_cb) s_l2_link_cb(false);
+    }
     return 0;
 }
 
@@ -939,46 +997,12 @@ extern esp_err_t esp_wifi_disconnect_internal(void);
 extern esp_err_t esp_wifi_register_wpa_cb_internal(const void *cb);
 
 typedef struct {
-    int            proto;
-    int            pairwise_cipher;
-    int            group_cipher;
-    int            key_mgmt;
-    int            capabilities;
-    size_t         num_pmkid;
-    const uint8_t *pmkid;
-    int            mgmt_group_cipher;
-    uint8_t        rsnxe_capa;
-} wifi_wpa_ie_t;
-
-typedef struct {
     void *fn[26];
 } wpa_funcs_compat_t;
 
 static bool osi_wpa_true(void) { return true; }
-static bool osi_wpa_false(void) { return false; }
 static int  osi_wpa_zero(void) { return 0; }
 static void osi_wpa_noop(void) {}
-static void *osi_wpa_null(void) { return NULL; }
-
-static int osi_wpa_parse_wpa_ie(const uint8_t *ie, size_t ie_len, wifi_wpa_ie_t *data) {
-    if (!ie || !data || ie_len < 4U) return -1;
-    memset(data, 0, sizeof(*data));
-    if (ie[0] == 0x30U) { // IEEE 802.11 RSN IE (WPA2/WPA3)
-        data->proto           = 2; // WPA_PROTO_RSN
-        data->pairwise_cipher = WIFI_CIPHER_TYPE_CCMP;
-        data->group_cipher    = WIFI_CIPHER_TYPE_CCMP;
-        data->key_mgmt        = 2; // WPA_KEY_MGMT_PSK
-        return 0;
-    }
-    if (ie[0] == 0xDDU) { // Microsoft WPA1 Vendor IE
-        data->proto           = 1; // WPA_PROTO_WPA
-        data->pairwise_cipher = WIFI_CIPHER_TYPE_TKIP;
-        data->group_cipher    = WIFI_CIPHER_TYPE_TKIP;
-        data->key_mgmt        = 2; // WPA_KEY_MGMT_PSK
-        return 0;
-    }
-    return -1;
-}
 
 static wpa_funcs_compat_t g_wpa_funcs_compat;
 
@@ -1025,17 +1049,17 @@ int32_t wifi_drv_init(void) {
     int32_t err = esp_wifi_init_internal(&cfg);
     if (err != 0) return err;
     memset(&g_wpa_funcs_compat, 0, sizeof(g_wpa_funcs_compat));
-    g_wpa_funcs_compat.fn[0]  = (void *)osi_wpa_true;         // wpa_sta_init
-    g_wpa_funcs_compat.fn[1]  = (void *)osi_wpa_true;         // wpa_sta_deinit
-    g_wpa_funcs_compat.fn[2]  = (void *)osi_wpa_zero;         // wpa_sta_connect
-    g_wpa_funcs_compat.fn[3]  = (void *)osi_wpa_noop;         // wpa_sta_connected_cb
-    g_wpa_funcs_compat.fn[4]  = (void *)osi_wpa_noop;         // wpa_sta_disconnected_cb
-    g_wpa_funcs_compat.fn[5]  = (void *)osi_wpa_zero;         // wpa_sta_rx_eapol
-    g_wpa_funcs_compat.fn[6]  = (void *)osi_wpa_false;        // wpa_sta_in_4way_handshake
-    g_wpa_funcs_compat.fn[15] = (void *)osi_wpa_parse_wpa_ie; // wpa_parse_wpa_ie
-    g_wpa_funcs_compat.fn[17] = (void *)osi_wpa_zero;         // wpa_michael_mic_failure
-    g_wpa_funcs_compat.fn[22] = (void *)osi_wpa_noop;         // wpa_config_done
-    g_wpa_funcs_compat.fn[25] = (void *)osi_wpa_noop;         // wpa_sta_clear_curr_pmksa
+    g_wpa_funcs_compat.fn[0]  = (void *)wifi_wpa2_sta_init;        // wpa_sta_init
+    g_wpa_funcs_compat.fn[1]  = (void *)wifi_wpa2_sta_deinit;      // wpa_sta_deinit
+    g_wpa_funcs_compat.fn[2]  = (void *)wifi_wpa2_sta_connect;     // wpa_sta_connect
+    g_wpa_funcs_compat.fn[3]  = (void *)wifi_wpa2_sta_connected;   // wpa_sta_connected_cb
+    g_wpa_funcs_compat.fn[4]  = (void *)wifi_wpa2_sta_disconnected;// wpa_sta_disconnected_cb
+    g_wpa_funcs_compat.fn[5]  = (void *)wifi_wpa2_sta_rx_eapol;    // wpa_sta_rx_eapol
+    g_wpa_funcs_compat.fn[6]  = (void *)wifi_wpa2_sta_in_4way;     // wpa_sta_in_4way_handshake
+    g_wpa_funcs_compat.fn[15] = (void *)wifi_wpa2_parse_wpa_ie;    // wpa_parse_wpa_ie
+    g_wpa_funcs_compat.fn[17] = (void *)osi_wpa_zero;              // wpa_michael_mic_failure
+    g_wpa_funcs_compat.fn[22] = (void *)osi_wpa_noop;              // wpa_config_done
+    g_wpa_funcs_compat.fn[25] = (void *)osi_wpa_noop;              // wpa_sta_clear_curr_pmksa
     (void)esp_wifi_register_wpa_cb_internal(&g_wpa_funcs_compat);
     err = esp_wifi_set_mode(WIFI_MODE_STA);
     if (err != 0) return err;
@@ -1091,8 +1115,17 @@ int32_t wifi_drv_connect(const char *ssid, const char *pass) {
     int32_t err = wifi_drv_init();
     if (err != 0) return err;
 
+    if (g_wifi_state == 3 || g_wifi_state == 4) {
+        (void)esp_wifi_disconnect_internal();
+        wifi_wpa2_reset();
+        rtos_delay(30);
+    }
+
     wifi_config_t wcfg;
     memset(&wcfg, 0, sizeof(wcfg));
+    wcfg.sta.scan_method    = WIFI_ALL_CHANNEL_SCAN;
+    wcfg.sta.sort_method    = WIFI_CONNECT_AP_BY_SIGNAL;
+    wcfg.sta.threshold.rssi = -127;
     if (ssid) {
         strncpy((char *)wcfg.sta.ssid, ssid, sizeof(wcfg.sta.ssid) - 1);
         strncpy(g_wifi_ssid, ssid, sizeof(g_wifi_ssid) - 1);
@@ -1100,7 +1133,7 @@ int32_t wifi_drv_connect(const char *ssid, const char *pass) {
     }
     if (pass && pass[0] != '\0') {
         strncpy((char *)wcfg.sta.password, pass, sizeof(wcfg.sta.password) - 1);
-        wcfg.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
+        wcfg.sta.threshold.authmode = WIFI_AUTH_WPA_PSK;
     } else {
         wcfg.sta.threshold.authmode = WIFI_AUTH_OPEN;
     }
