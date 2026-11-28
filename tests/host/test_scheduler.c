@@ -7,6 +7,7 @@
 #include "zen_net.h"
 #include "zen_net_utils.h"
 #include "zen_tcp.h"
+#include "zen_net6.h"
 
 void bsp_uart_puts(const char *s) { (void)s; }
 
@@ -522,7 +523,7 @@ static void test_zen_net_arp_and_dhcp(void) {
     zen_net_init(sta_mac, (void *)mock_eth_tx);
     zen_net_set_link(true);
     assert(zen_net_get_dhcp_state() == ZEN_DHCP_SELECTING);
-    assert(g_mock_tx_cnt == 1);
+    assert(g_mock_tx_cnt == 2); // IPv6 Router Solicitation + DHCPDISCOVER
     assert(g_mock_tx_len >= 14 + 20 + 8 + 240);
     // Extract DHCP XID from transmitted DISCOVER
     uint32_t xid = ((uint32_t)g_mock_tx_buf[46] << 24) | ((uint32_t)g_mock_tx_buf[47] << 16) |
@@ -552,7 +553,7 @@ static void test_zen_net_arp_and_dhcp(void) {
     build_mock_ipv4_udp(frame, &flen, gw_mac, sta_mac, 0xC0A80101U, 0xFFFFFFFFU, 67, 68, dhcp, sizeof(dhcp));
     zen_net_rx_frame(frame, flen);
     assert(zen_net_get_dhcp_state() == ZEN_DHCP_REQUESTING);
-    assert(g_mock_tx_cnt == 2); // Sent DHCPREQUEST
+    assert(g_mock_tx_cnt == 3); // Sent DHCPREQUEST
 
     // 4. Inject DHCPACK -> must bind IP/Mask/GW/DNS and send ARP probe for GW
     dhcp[242] = 5; // DHCPACK
@@ -814,6 +815,130 @@ static void test_zen_tcp_and_http(void) {
     printf("          ZenTCP 3-way handshake, PSH+ACK, FIN EOF & HTTP/1.1 GET verified. [PASS]\n");
 }
 
+// -------------------------------------------------------------------------
+// Test 18: ZenNet6 Phase 5 IPv6 (Parse/Format, SLAAC RA, NDP NS->NA, Ping6, AAAA)
+// -------------------------------------------------------------------------
+static uint16_t icmp6_test_csum(const uint8_t src[16], const uint8_t dst[16],
+                                const uint8_t *icmp6, size_t len) {
+    uint32_t sum = 0;
+    for (size_t i = 0; i < 16; i += 2) {
+        sum += ((uint32_t)src[i] << 8) | src[i + 1];
+        sum += ((uint32_t)dst[i] << 8) | dst[i + 1];
+    }
+    sum += (uint32_t)len + 58U;
+    for (size_t i = 0; i + 1 < len; i += 2) {
+        sum += ((uint32_t)icmp6[i] << 8) | icmp6[i + 1];
+    }
+    if (len & 1U) sum += (uint32_t)icmp6[len - 1] << 8;
+    while (sum >> 16) sum = (sum & 0xFFFFU) + (sum >> 16);
+    return (uint16_t)(~sum & 0xFFFFU);
+}
+
+static void inject_mock_icmp6(const uint8_t src_mac[6], const uint8_t dst_mac[6],
+                              const uint8_t src_ip[16], const uint8_t dst_ip[16],
+                              uint8_t hlim, const uint8_t *icmp6_in, uint16_t ilen) {
+    uint8_t frame[256];
+    memset(frame, 0, 14 + 40 + ilen);
+    memcpy(frame + 0, dst_mac, 6);
+    memcpy(frame + 6, src_mac, 6);
+    frame[12] = 0x86; frame[13] = 0xDD;
+    uint8_t *ip6 = frame + 14;
+    ip6[0] = 0x60;
+    ip6[4] = (uint8_t)(ilen >> 8); ip6[5] = (uint8_t)(ilen);
+    ip6[6] = 58; ip6[7] = hlim;
+    memcpy(ip6 + 8,  src_ip, 16);
+    memcpy(ip6 + 24, dst_ip, 16);
+    memcpy(ip6 + 40, icmp6_in, ilen);
+    ip6[42] = 0; ip6[43] = 0;
+    uint16_t cs = icmp6_test_csum(src_ip, dst_ip, ip6 + 40, ilen);
+    ip6[42] = (uint8_t)(cs >> 8); ip6[43] = (uint8_t)(cs);
+    zen_net_rx_frame(frame, (uint16_t)(14 + 40 + ilen));
+}
+
+static void test_zen_net6_ipv6_slaac_ndp_and_ping6(void) {
+    printf("[TEST 18] Verifying ZenNet6 IPv6 SLAAC, NDP, ICMPv6 ping6 & DNS AAAA...\n");
+
+    // 1. RFC 5952 parse & format
+    uint8_t addr[16];
+    char str[40];
+    assert(zen_ip6_parse("2607:fea8:f49a:ad00::217c", addr));
+    zen_ip6_format(addr, str, sizeof(str));
+    assert(strcmp(str, "2607:fea8:f49a:ad00::217c") == 0);
+    assert(zen_ip6_parse("fe80::424c:caff:fe53:a2a4", addr));
+    zen_ip6_format(addr, str, sizeof(str));
+    assert(strcmp(str, "fe80::424c:caff:fe53:a2a4") == 0);
+
+    // 2. Init & verify EUI-64 Link-Local address from MAC 40:4C:CA:53:A2:A4
+    static const uint8_t sta_mac[6] = { 0x40, 0x4C, 0xCA, 0x53, 0xA2, 0xA4 };
+    static const uint8_t rtr_mac[6] = { 0xD4, 0x6C, 0x6D, 0xA5, 0xD0, 0xCC };
+    static const uint8_t mcast_all[6] = { 0x33, 0x33, 0x00, 0x00, 0x00, 0x01 };
+    zen_net_init(sta_mac, (void *)mock_eth_tx);
+    zen_net_set_link(true);
+    assert(zen_net6_has_link_local());
+    uint8_t ll[16];
+    zen_net6_get_link_local(ll);
+    zen_ip6_format(ll, str, sizeof(str));
+    assert(strcmp(str, "fe80::424c:caff:fe53:a2a4") == 0);
+
+    // 3. Inject Router Advertisement (Type 134) with 2607:fea8:f49a:ad00::/64 prefix
+    uint8_t rtr_ll[16], ff02_1[16];
+    assert(zen_ip6_parse("fe80::1", rtr_ll));
+    assert(zen_ip6_parse("ff02::1", ff02_1));
+    uint8_t ra[16 + 8 + 32];
+    memset(ra, 0, sizeof(ra));
+    ra[0] = 134; ra[4] = 64; ra[6] = 0x07; ra[7] = 0x08; // Router Lifetime = 1800s
+    // Option 1: Source Link-Layer Addr
+    ra[16] = 1; ra[17] = 1; memcpy(ra + 18, rtr_mac, 6);
+    // Option 3: Prefix Info (64-bit, Autonomous=0x40, On-Link=0x80)
+    ra[24] = 3; ra[25] = 4; ra[26] = 64; ra[27] = 0xC0;
+    uint8_t pfx[8] = { 0x26, 0x07, 0xfe, 0xa8, 0xf4, 0x9a, 0xad, 0x00 };
+    memcpy(ra + 40, pfx, 8);
+    inject_mock_icmp6(rtr_mac, mcast_all, rtr_ll, ff02_1, 255, ra, sizeof(ra));
+    assert(zen_net6_has_global() && zen_net6_has_gateway());
+    uint8_t glob[16];
+    zen_net6_get_global(glob);
+    zen_ip6_format(glob, str, sizeof(str));
+    assert(strcmp(str, "2607:fea8:f49a:ad00:424c:caff:fe53:a2a4") == 0);
+
+    // 4. Inject Neighbor Solicitation (135) for our Global IPv6 -> must reply NA (136)
+    uint8_t ns[24];
+    memset(ns, 0, sizeof(ns));
+    ns[0] = 135;
+    memcpy(ns + 8, glob, 16);
+    uint32_t prev_tx = g_mock_tx_cnt;
+    inject_mock_icmp6(rtr_mac, sta_mac, rtr_ll, glob, 255, ns, sizeof(ns));
+    assert(g_mock_tx_cnt == prev_tx + 1);
+    assert(g_mock_tx_buf[12] == 0x86 && g_mock_tx_buf[13] == 0xDD);
+    assert(g_mock_tx_buf[54] == 136); // Neighbor Advertisement
+
+    // 5. Inject ICMPv6 Echo Request (128) -> must reply Echo Reply (129)
+    uint8_t echo[12] = { 128, 0, 0, 0, 0x12, 0x34, 0x00, 0x01, 'I', 'P', 'V', '6' };
+    prev_tx = g_mock_tx_cnt;
+    inject_mock_icmp6(rtr_mac, sta_mac, rtr_ll, glob, 64, echo, sizeof(echo));
+    assert(g_mock_tx_cnt == prev_tx + 1);
+    assert(g_mock_tx_buf[54] == 129); // ICMPv6 Echo Reply
+    assert(memcmp(g_mock_tx_buf + 62, "IPV6", 4) == 0);
+
+    // 6. DNS AAAA (TYPE=28) query build & response parsing
+    uint8_t q[128], resp[160];
+    size_t qlen = zen_dns_build_query_type("google.com", 28, 0xBEEF, q, sizeof(q));
+    assert(qlen > 12 && q[qlen - 3] == 28);
+    memcpy(resp, q, qlen);
+    resp[2] = 0x81; resp[3] = 0x80; resp[7] = 1;
+    uint8_t aaaa_ans[28] = {
+        0xC0, 0x0C, 0x00, 28, 0x00, 0x01, 0, 0, 0, 60, 0x00, 16,
+        0x26, 0x07, 0xf8, 0xb0, 0x40, 0x0b, 0x08, 0x02,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x20, 0x0e
+    };
+    memcpy(resp + qlen, aaaa_ans, sizeof(aaaa_ans));
+    uint8_t g_ip6[16];
+    assert(zen_dns_parse_aaaa(resp, qlen + sizeof(aaaa_ans), 0xBEEF, g_ip6));
+    zen_ip6_format(g_ip6, str, sizeof(str));
+    assert(strcmp(str, "2607:f8b0:400b:802::200e") == 0);
+
+    printf("          IPv6 RFC 5952, SLAAC RA, NDP NS->NA, ICMPv6 Echo & DNS AAAA verified. [PASS]\n");
+}
+
 int main(void) {
     printf("====================================================\n");
     printf("      ZenRTOS Host Verification Test Suite         \n");
@@ -836,9 +961,10 @@ int main(void) {
     test_zen_net_icmp_and_udp();
     test_zen_net_utils_dns_and_sntp();
     test_zen_tcp_and_http();
+    test_zen_net6_ipv6_slaac_ndp_and_ping6();
 
     printf("====================================================\n");
-    printf("  ALL 17 UNIT TESTS PASSED SUCCESSFULLY! (100%%)     \n");
+    printf("  ALL 18 UNIT TESTS PASSED SUCCESSFULLY! (100%%)     \n");
     printf("====================================================\n");
     return 0;
 }

@@ -8,6 +8,7 @@ import "rtos.h" as rtos;
 extern fn zen_net_is_up() -> bool;
 extern fn zen_net_get_dns() -> u32;
 extern fn zen_ip4_parse(s: char*, out_ip: u32*) -> bool;
+extern fn zen_ip6_parse(s: char*, out_ip6: u8*) -> bool;
 extern fn zen_udp_bind(local_port: u16) -> i32;
 extern fn zen_udp_unbind(slot: i32);
 extern fn zen_udp_slot_port(slot: i32) -> u16;
@@ -54,7 +55,7 @@ fn u_wr_be16(p: u8*, v: u16) {
 // 1. RFC 1035 DNS A-Record Resolver
 // ===========================================================================
 @used
-fn zen_dns_build_query(host: char*, txid: u16, buf: u8*, cap: usize) -> usize {
+fn zen_dns_build_query_type(host: char*, qtype: u16, txid: u16, buf: u8*, cap: usize) -> usize {
     if host == (char*)0 || buf == (u8*)0 || cap < 24 {
         return 0;
     }
@@ -98,9 +99,14 @@ fn zen_dns_build_query(host: char*, txid: u16, buf: u8*, cap: usize) -> usize {
     }
     buf[pos] = (u8)0; // Root label terminator
     pos = pos + 1;
-    u_wr_be16(&buf[pos], (u16)1);     // QTYPE = A (IPv4)
+    u_wr_be16(&buf[pos], qtype);      // QTYPE = 1 (A) or 28 (AAAA)
     u_wr_be16(&buf[pos + 2], (u16)1); // QCLASS = IN
     return pos + 4;
+}
+
+@used
+fn zen_dns_build_query(host: char*, txid: u16, buf: u8*, cap: usize) -> usize {
+    return zen_dns_build_query_type(host, (u16)1, txid, buf, cap);
 }
 
 fn dns_skip_name(pkt: u8*, len: usize, start: usize) -> usize {
@@ -232,6 +238,108 @@ fn zen_dns_resolve(host: char*, out_ip: u32*, timeout_ms: u32) -> bool {
         }
         // Rebuild query for retry since g_dns_pkt_buf may have been overwritten
         qlen = zen_dns_build_query(host, txid, &g_dns_pkt_buf[0], 300);
+        attempt = attempt + 1;
+    }
+
+    zen_udp_unbind(slot);
+    return false;
+}
+
+@used
+fn zen_dns_parse_aaaa(pkt: u8*, len: usize, expect_txid: u16, out_ip6: u8*) -> bool {
+    if pkt == (u8*)0 || out_ip6 == (u8*)0 || len < 12 {
+        return false;
+    }
+    if u_rd_be16(&pkt[0]) != expect_txid {
+        return false;
+    }
+    let flags: u16 = u_rd_be16(&pkt[2]);
+    if (flags & 0x8000) == 0 || (flags & 0x000F) != 0 {
+        return false;
+    }
+    let qdcount: u16 = u_rd_be16(&pkt[4]);
+    let ancount: u16 = u_rd_be16(&pkt[6]);
+    if ancount == 0 {
+        return false;
+    }
+
+    let pos: usize = 12;
+    let q: u16 = 0;
+    while q < qdcount {
+        pos = dns_skip_name(pkt, len, pos);
+        if pos + 4 > len { return false; }
+        pos = pos + 4;
+        q = q + (u16)1;
+    }
+
+    let a: u16 = 0;
+    while a < ancount && pos < len {
+        pos = dns_skip_name(pkt, len, pos);
+        if pos + 10 > len { return false; }
+        let rtype: u16  = u_rd_be16(&pkt[pos]);
+        let rclass: u16 = u_rd_be16(&pkt[pos + 2]);
+        let rdlen: u16  = u_rd_be16(&pkt[pos + 8]);
+        pos = pos + 10;
+        if pos + (usize)rdlen > len { return false; }
+        if rtype == 28 && rclass == 1 && rdlen == 16 {
+            let k: usize = 0;
+            while k < 16 {
+                out_ip6[k] = pkt[pos + k];
+                k = k + 1;
+            }
+            return true;
+        }
+        pos = pos + (usize)rdlen;
+        a = a + (u16)1;
+    }
+    return false;
+}
+
+@used
+fn zen_dns_resolve6(host: char*, out_ip6: u8*, timeout_ms: u32) -> bool {
+    if host == (char*)0 || out_ip6 == (u8*)0 {
+        return false;
+    }
+    if zen_ip6_parse(host, out_ip6) {
+        return true;
+    }
+    if !zen_net_is_up() {
+        return false;
+    }
+
+    let dns_ip: u32 = zen_net_get_dns();
+    if dns_ip == 0 { dns_ip = FALLBACK_DNS_IP; }
+
+    let slot: i32 = zen_udp_bind((u16)0);
+    if slot < 0 { return false; }
+    let local_port: u16 = zen_udp_slot_port(slot);
+
+    let txid: u16 = g_dns_txid;
+    g_dns_txid = g_dns_txid + (u16)1;
+    let qlen: usize = zen_dns_build_query_type(host, (u16)28, txid, &g_dns_pkt_buf[0], 300);
+    if qlen == 0 {
+        zen_udp_unbind(slot);
+        return false;
+    }
+
+    let per_try_ms: u32 = timeout_ms / 2;
+    if per_try_ms < 250 { per_try_ms = 250; }
+
+    let attempt: u32 = 0;
+    while attempt < 2 {
+        let srv: u32 = dns_ip;
+        if attempt == 1 && dns_ip != FALLBACK_DNS_IP {
+            srv = FALLBACK_DNS_IP;
+        }
+        let _rc: i32 = zen_udp_sendto(local_port, srv, DNS_PORT, &g_dns_pkt_buf[0], (u16)qlen);
+        let src_ip: u32 = 0;
+        let src_port: u16 = 0;
+        let n: i32 = zen_udp_recvfrom(slot, &g_dns_pkt_buf[0], (u16)300, &src_ip, &src_port, per_try_ms);
+        if n >= 12 && zen_dns_parse_aaaa(&g_dns_pkt_buf[0], (usize)n, txid, out_ip6) {
+            zen_udp_unbind(slot);
+            return true;
+        }
+        qlen = zen_dns_build_query_type(host, (u16)28, txid, &g_dns_pkt_buf[0], 300);
         attempt = attempt + 1;
     }
 

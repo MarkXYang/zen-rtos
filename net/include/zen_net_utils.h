@@ -9,10 +9,13 @@
 extern "C" {
 #endif
 
-// RFC 1035 DNS A-record resolver (UDP port 53)
+// RFC 1035 / RFC 3596 DNS A & AAAA resolver (UDP port 53)
 size_t   zen_dns_build_query(const char *host, uint16_t txid, uint8_t *buf, size_t cap);
+size_t   zen_dns_build_query_type(const char *host, uint16_t qtype, uint16_t txid, uint8_t *buf, size_t cap);
 bool     zen_dns_parse_response(const uint8_t *pkt, size_t len, uint16_t expect_txid, uint32_t *out_ip);
+bool     zen_dns_parse_aaaa(const uint8_t *pkt, size_t len, uint16_t expect_txid, uint8_t out_ip6[16]);
 bool     zen_dns_resolve(const char *host, uint32_t *out_ip, uint32_t timeout_ms);
+bool     zen_dns_resolve6(const char *host, uint8_t out_ip6[16], uint32_t timeout_ms);
 
 // RFC 4330 SNTPv4 UTC clock sync (UDP port 123)
 bool     zen_sntp_sync(uint32_t server_ip, uint32_t timeout_ms);

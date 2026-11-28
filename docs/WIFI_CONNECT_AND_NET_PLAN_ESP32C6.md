@@ -156,10 +156,20 @@ To make debugging, provisioning, and application development turnkey without ext
 
 ---
 
-### Phase 4 (Optional Future Extension): Full TCP/IP via `lwIP`
-If an application requires **TCP** (HTTP client/server, MQTT broker connection, TLS):
-- Add `scripts/fetch_lwip.sh` (`STABLE-2_2_0_RELEASE`).
-- Implement `sys_arch.c` (~180 LOC mapping `sys_sem_t`, `sys_mutex_t`, `sys_mbox_t`, `sys_thread_new` directly to ZenRTOS primitives — virtually identical to `wifi_osi.c`) and `wlanif.c` (~90 LOC wrapping `esp_wifi_internal_tx` / `rxcb`).
+### Phase 4: Native ZenTCP & HTTP/1.1 Client (`net/zen_tcp.zc`) — Completed
+Implemented a zero-dependency RFC 793 TCP client + HTTP/1.1 GET client in pure **Zen-C** (`net/zen_tcp.zc` + `net/include/zen_tcp.h`, ~5 KB RAM):
+- 2 concurrent TCP sockets, 3-way `SYN -> SYN+ACK -> ACK` handshake with MSS=1360, RFC 793 pseudo-header checksum, 600 ms retransmit timer, 2 KB circular RX ring buffer, `rtos_sem_t` blocking `zen_tcp_connect/send/recv/close`, and `http get <host> [path] [port]`.
+*(An optional `lwIP` port remains possible later if full server-side TLS/multi-socket TCP is ever needed.)*
+
+---
+
+### Phase 5: Native ZenNet IPv6 Stack (`net/zen_net6.zc` — SLAAC, NDP, `ping6`, DNS `AAAA`)
+Add full dual-stack IPv6 support in pure **Zen-C** (`net/zen_net6.zc` + `net/include/zen_net6.h`, ~3 KB RAM) hooked into `EtherType == 0x86DD` in `net/zen_net.zc`:
+- **RFC 4862 SLAAC & EUI-64 Link-Local**: Auto-derives `fe80::` from the STA MAC on `L2 link UP`, sends **Router Solicitation (`ICMPv6 133`)** to `ff02::2`, and parses **Router Advertisement (`ICMPv6 134`)** Prefix Info (`Opt 3`) to auto-configure a Global IPv6 address (`/64`) and default IPv6 router.
+- **RFC 4861 Neighbor Discovery (NDP)**: 8-entry IPv6 neighbor cache + 1-packet pending TX queue; responds to **Neighbor Solicitation (`135`)** with **Neighbor Advertisement (`136`)** and resolves on-link neighbors via solicited-node multicast (`ff02::1:ffXX:XXXX`).
+- **RFC 4443 Bidirectional `ping6` (`ICMPv6 128/129`)**: Answers inbound `ping -6 <esp32c6_ipv6>` and sends outbound `ping6 <host|ipv6> [n]` with RTT and Hop Limit reporting.
+- **RFC 5952 Formatting & RFC 3596 DNS `AAAA`**: `zen_ip6_parse()`, `zen_ip6_format()` (`::` zero compression), and `zen_dns_resolve6()` (`TYPE=28`, exposed as `nslookup6 <domain>` and integrated into `ping6`).
+- **New `zensh>` Commands**: `ifconfig` displays `inet6` (Link-Local + Global + GW6), plus `ping6 <host|ipv6> [n]`, `ndp [flush]`, and `nslookup6 <domain>`.
 
 ---
 

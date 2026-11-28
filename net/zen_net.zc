@@ -9,6 +9,10 @@ extern fn bsp_uart_puts(s: char*);
 extern fn zen_tcp_init();
 extern fn zen_tcp_rx_ip4(src_ip: u32, payload: u8*, len: usize);
 extern fn zen_tcp_tick(now_ms: u32);
+extern fn zen_net6_init(mac: u8*);
+extern fn zen_net6_set_link(up: bool);
+extern fn zen_net6_rx_frame(frame: u8*, len: u16);
+extern fn zen_net6_tick(now_ms: u32);
 
 // ===========================================================================
 // Constants
@@ -16,6 +20,7 @@ extern fn zen_tcp_tick(now_ms: u32);
 def ETH_HDR_LEN: usize       = 14;
 def ETH_TYPE_IPV4: u16       = 0x0800;
 def ETH_TYPE_ARP: u16        = 0x0806;
+def ETH_TYPE_IPV6: u16       = 0x86DD;
 
 def IP_PROTO_ICMP: u8        = 1;
 def IP_PROTO_TCP: u8         = 6;
@@ -290,6 +295,11 @@ fn eth_tx_raw(_frame: u8*, len: u16) -> i32 {
         g_stats.tx_bytes  = g_stats.tx_bytes + (u32)len;
     }
     return rc;
+}
+
+@used
+fn zen_net_eth_tx_raw(frame: u8*, len: u16) -> i32 {
+    return eth_tx_raw(frame, len);
 }
 
 // ===========================================================================
@@ -888,6 +898,7 @@ fn zen_net_init(mac: u8*, tx_cb: void*) {
     }
     rtos::rtos_sem_init(&g_ping_sem, 0, 1);
     zen_tcp_init();
+    zen_net6_init(&g_our_mac[0]);
     g_net_inited = true;
 }
 
@@ -929,10 +940,12 @@ fn zen_net_set_link(up: bool) {
     g_pending_valid = false;
     g_now_ms        = rtos::rtos_get_tick();
     if up {
+        zen_net6_set_link(true);
         if g_dhcp_state != DHCP_STATIC {
             zen_net_dhcp_start();
         }
     } else {
+        zen_net6_set_link(false);
         if g_dhcp_state != DHCP_STATIC {
             g_our_ip         = 0;
             g_netmask        = 0;
@@ -961,6 +974,8 @@ fn zen_net_rx_frame(frame: u8*, len: u16) {
         arp_rx(payload, pay_len);
     } else if ethertype == ETH_TYPE_IPV4 {
         ipv4_rx(&frame[6], payload, pay_len);
+    } else if ethertype == ETH_TYPE_IPV6 {
+        zen_net6_rx_frame(frame, len);
     }
 }
 
@@ -974,6 +989,7 @@ fn zen_net_tick(now_ms: u32) {
         return;
     }
     zen_tcp_tick(now_ms);
+    zen_net6_tick(now_ms);
 
     // DHCPv4 periodic retransmit (every 2000 ms while SELECTING or REQUESTING)
     if g_dhcp_state == DHCP_SELECTING {

@@ -79,6 +79,19 @@ extern fn zen_syslog_send(msg: char*) -> i32;
 extern fn zen_http_get(host: char*, port: u16, path: char*,
                        out_buf: u8*, cap: u16, timeout_ms: u32) -> i32;
 
+// ZenNet6 Phase 5 IPv6 API (net/zen_net6.zc & net/net_utils.zc)
+extern fn zen_net6_has_link_local() -> bool;
+extern fn zen_net6_has_global() -> bool;
+extern fn zen_net6_has_gateway() -> bool;
+extern fn zen_net6_get_link_local(out: u8*);
+extern fn zen_net6_get_global(out: u8*);
+extern fn zen_net6_get_gateway(out: u8*);
+extern fn zen_net6_ndp_flush();
+extern fn zen_net6_ndp_get_entry(idx: u32, out_ip6: u8*, out_mac: u8*, out_age_sec: u32*) -> bool;
+extern fn zen_net6_ping(dst_ip6: u8*, seq: u16, timeout_ms: u32, out_rtt_ms: u32*, out_hlim: u8*) -> bool;
+extern fn zen_ip6_format(ip: u8*, buf: char*, cap: usize);
+extern fn zen_dns_resolve6(host: char*, out_ip6: u8*, timeout_ms: u32) -> bool;
+
 let g_http_rx_buf: u8[1024];
 
 fn wifi_put_hex_byte(b: u8) {
@@ -101,6 +114,12 @@ fn wifi_put_mac_raw(mac: u8*) {
 fn wifi_put_ip(ip: u32) {
     let buf: char[16];
     zen_ip4_format(ip, &buf[0], 16);
+    bsp_uart_puts(&buf[0]);
+}
+
+fn wifi_put_ip6(ip6: u8*) {
+    let buf: char[40];
+    zen_ip6_format(ip6, &buf[0], 40);
     bsp_uart_puts(&buf[0]);
 }
 
@@ -312,6 +331,26 @@ fn cmd_ifconfig(cmd: char*) {
         bsp_uart_puts("s rem)\n");
     } else if ds == 4 { bsp_uart_puts("STATIC\n"); }
     else { bsp_uart_puts("UNKNOWN\n"); }
+
+    let ip6: u8[16];
+    if zen_net6_has_link_local() {
+        zen_net6_get_link_local(&ip6[0]);
+        bsp_uart_puts("          inet6:  ");
+        wifi_put_ip6(&ip6[0]);
+        bsp_uart_puts("/64 (link-local)\n");
+    }
+    if zen_net6_has_global() {
+        zen_net6_get_global(&ip6[0]);
+        bsp_uart_puts("          inet6:  ");
+        wifi_put_ip6(&ip6[0]);
+        bsp_uart_puts("/64 (SLAAC global)\n");
+    }
+    if zen_net6_has_gateway() {
+        zen_net6_get_gateway(&ip6[0]);
+        bsp_uart_puts("          gw6:    ");
+        wifi_put_ip6(&ip6[0]);
+        bsp_uart_puts("\n");
+    }
 }
 
 fn cmd_arp(cmd: char*) {
@@ -788,9 +827,162 @@ fn cmd_http(cmd: char*) {
     bsp_uart_puts("\n--- End HTTP ---\n");
 }
 
+fn cmd_ndp(cmd: char*) {
+    if wifi_starts_with(cmd, "ndp flush") {
+        zen_net6_ndp_flush();
+        bsp_uart_puts("NDP neighbor cache flushed.\n");
+        return;
+    }
+    bsp_uart_puts("  IPv6 Address                             HW Address          Age\n");
+    let count: u32 = 0;
+    let i: u32 = 0;
+    while i < 8 {
+        let ip6: u8[16];
+        let mac: u8[6];
+        let age: u32 = 0;
+        if zen_net6_ndp_get_entry(i, &ip6[0], &mac[0], &age) {
+            bsp_uart_puts("  ");
+            wifi_put_ip6(&ip6[0]);
+            bsp_uart_puts("   ");
+            wifi_put_mac_raw(&mac[0]);
+            bsp_uart_puts("   ");
+            bsp_uart_putdec(age);
+            bsp_uart_puts("s\n");
+            count = count + 1;
+        }
+        i = i + 1;
+    }
+    if count == 0 {
+        bsp_uart_puts("  (NDP cache empty)\n");
+    }
+}
+
+fn cmd_nslookup6(cmd: char*) {
+    if !zen_net_is_up() {
+        bsp_uart_puts("Network interface is DOWN.\n");
+        return;
+    }
+    let host: char[64];
+    if wifi_copy_token(&cmd[10], &host[0], 64) == 0 {
+        bsp_uart_puts("Usage: nslookup6 <domain>\n");
+        return;
+    }
+    let ip6: u8[16];
+    if zen_dns_resolve6(&host[0], &ip6[0], 2000) {
+        bsp_uart_puts("AAAA:    ");
+        bsp_uart_puts(&host[0]);
+        bsp_uart_puts(" -> ");
+        wifi_put_ip6(&ip6[0]);
+        bsp_uart_puts("\n");
+    } else {
+        bsp_uart_puts("DNS AAAA lookup failed for '");
+        bsp_uart_puts(&host[0]);
+        bsp_uart_puts("'\n");
+    }
+}
+
+fn cmd_ping6(cmd: char*) {
+    if !zen_net_link_is_up() {
+        bsp_uart_puts("Wi-Fi link is DOWN.\n");
+        return;
+    }
+    let arg: char* = &cmd[6];
+    let host: char[64];
+    if wifi_copy_token(arg, &host[0], 64) == 0 {
+        bsp_uart_puts("Usage: ping6 <host|ipv6> [count]\n");
+        return;
+    }
+    let ip6: u8[16];
+    if !zen_dns_resolve6(&host[0], &ip6[0], 2000) {
+        bsp_uart_puts("Could not resolve IPv6 host '");
+        bsp_uart_puts(&host[0]);
+        bsp_uart_puts("'\n");
+        return;
+    }
+    let count: u32 = 4;
+    let cnt_str: char* = wifi_skip_token(arg);
+    if cnt_str[0] != '\0' {
+        let parsed: u32 = 0;
+        if wifi_parse_u32(cnt_str, &parsed) && parsed > 0 && parsed <= 20 {
+            count = parsed;
+        }
+    }
+
+    bsp_uart_puts("PING6 ");
+    bsp_uart_puts(&host[0]);
+    bsp_uart_puts(" (");
+    wifi_put_ip6(&ip6[0]);
+    bsp_uart_puts("): 32 data bytes\n");
+
+    let rx_ok: u32 = 0;
+    let rtt_min: u32 = 0xFFFFFFFF;
+    let rtt_max: u32 = 0;
+    let rtt_sum: u32 = 0;
+
+    let seq: u32 = 1;
+    while seq <= count {
+        let rtt: u32 = 0;
+        let hlim: u8 = 0;
+        if zen_net6_ping(&ip6[0], (u16)seq, 1500, &rtt, &hlim) {
+            bsp_uart_puts("  Reply from ");
+            wifi_put_ip6(&ip6[0]);
+            bsp_uart_puts(": seq=");
+            bsp_uart_putdec(seq);
+            bsp_uart_puts(" hlim=");
+            bsp_uart_putdec((u32)hlim);
+            bsp_uart_puts(" time=");
+            bsp_uart_putdec(rtt);
+            bsp_uart_puts(" ms\n");
+            rx_ok = rx_ok + 1;
+            rtt_sum = rtt_sum + rtt;
+            if rtt < rtt_min { rtt_min = rtt; }
+            if rtt > rtt_max { rtt_max = rtt; }
+        } else {
+            bsp_uart_puts("  Request timed out (seq=");
+            bsp_uart_putdec(seq);
+            bsp_uart_puts(")\n");
+        }
+        if seq < count {
+            rtos::rtos_delay(500);
+        }
+        seq = seq + 1;
+    }
+
+    let loss: u32 = ((count - rx_ok) * 100) / count;
+    bsp_uart_puts("--- ping6 stats: ");
+    bsp_uart_putdec(count);
+    bsp_uart_puts(" tx, ");
+    bsp_uart_putdec(rx_ok);
+    bsp_uart_puts(" rx, ");
+    bsp_uart_putdec(loss);
+    bsp_uart_puts("% loss");
+    if rx_ok > 0 {
+        bsp_uart_puts(", rtt min/avg/max = ");
+        bsp_uart_putdec(rtt_min);
+        bsp_uart_putc('/');
+        bsp_uart_putdec(rtt_sum / rx_ok);
+        bsp_uart_putc('/');
+        bsp_uart_putdec(rtt_max);
+        bsp_uart_puts(" ms");
+    }
+    bsp_uart_puts(" ---\n");
+}
+
 // Exported hook called by bsp/esp32c6/esp32c6.zc zensh> shell
 @used
 fn bsp_wifi_shell_cmd(cmd: char*) -> bool {
+    if wifi_starts_with(cmd, "ndp") && (cmd[3] == '\0' || cmd[3] == ' ') {
+        cmd_ndp(cmd);
+        return true;
+    }
+    if wifi_starts_with(cmd, "nslookup6 ") {
+        cmd_nslookup6(cmd);
+        return true;
+    }
+    if wifi_starts_with(cmd, "ping6 ") {
+        cmd_ping6(cmd);
+        return true;
+    }
     if wifi_starts_with(cmd, "http") && (cmd[4] == '\0' || cmd[4] == ' ') {
         cmd_http(cmd);
         return true;

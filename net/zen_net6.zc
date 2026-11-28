@@ -1,0 +1,915 @@
+// ZenNet Phase 5: Native IPv6 Stack in Zen-C
+// Implements EUI-64 Link-Local auto-config, RFC 4862 SLAAC (RS/RA),
+// RFC 4861 Neighbor Discovery (NDP 8-entry cache + 1-packet pending TX),
+// RFC 4443 bidirectional ICMPv6 Echo (ping6), and RFC 5952 IPv6 parse/format.
+
+import "rtos.h" as rtos;
+
+extern fn bsp_uart_puts(s: char*);
+extern fn zen_net_eth_tx_raw(frame: u8*, len: u16) -> i32;
+
+// Constants
+def ETH6_HDR_LEN: usize      = 14;
+def IPV6_HDR_LEN: usize      = 40;
+def ETH6_TYPE_IPV6: u16      = 0x86DD;
+def IPV6_NEXT_ICMP6: u8      = 58;
+
+def ICMP6_ECHO_REQ: u8       = 128;
+def ICMP6_ECHO_REPLY: u8     = 129;
+def ICMP6_ROUTER_SOL: u8     = 133;
+def ICMP6_ROUTER_ADV: u8     = 134;
+def ICMP6_NEIGH_SOL: u8      = 135;
+def ICMP6_NEIGH_ADV: u8      = 136;
+def ICMP6_PING_ID: u16       = 0x5A36; // "Z6"
+
+def NDP_TABLE_SIZE: u32      = 8;
+def NDP_TTL_MS: u32          = 300000;
+def MAX6_FRAME_LEN: usize    = 1518;
+
+struct NdpEntry {
+    valid: bool;
+    ip6: u8[16];
+    mac: u8[6];
+    stamp_ms: u32;
+}
+
+// Module State
+let g_net6_inited: bool      = false;
+let g_net6_link_up: bool     = false;
+let g_net6_mac: u8[6];
+let g_net6_now_ms: u32       = 0;
+
+let g_has_ll6: bool          = false;
+let g_ll6: u8[16];
+let g_has_global6: bool      = false;
+let g_global6: u8[16];
+let g_prefix6: u8[8];
+let g_has_gw6: bool          = false;
+let g_gw6: u8[16];
+
+let g_rs_sent_cnt: u32       = 0;
+let g_rs_last_ms: u32        = 0;
+
+let g_ndp_table: NdpEntry[8];
+
+// 1-packet pending TX buffer while awaiting NDP Neighbor Advertisement
+let g_pend6_valid: bool      = false;
+let g_pend6_hop: u8[16];
+let g_pend6_len: u16         = 0;
+let g_pend6_frame: u8[1518];
+
+// Static scratch TX buffers (keeps SysTimer/Shell stack usage tiny)
+let g_tx6_frame: u8[1518];
+let g_icmp6_reply_buf: u8[1440];
+
+// Ping6 waiter state
+let g_ping6_waiting: bool    = false;
+let g_ping6_expect_ip: u8[16];
+let g_ping6_expect_seq: u16  = 0;
+let g_ping6_got_reply: bool  = false;
+let g_ping6_reply_hlim: u8   = 0;
+let g_ping6_reply_ms: u32    = 0;
+let g_ping6_sem: rtos::rtos_sem_t;
+
+// ===========================================================================
+// Helpers
+// ===========================================================================
+fn n6_copy(dst: u8*, src: u8*, n: usize) {
+    let i: usize = 0;
+    while i < n {
+        dst[i] = src[i];
+        i = i + 1;
+    }
+}
+
+fn n6_zero(dst: u8*, n: usize) {
+    let i: usize = 0;
+    while i < n {
+        dst[i] = (u8)0;
+        i = i + 1;
+    }
+}
+
+fn n6_eq(a: u8*, b: u8*, n: usize) -> bool {
+    let i: usize = 0;
+    while i < n {
+        if a[i] != b[i] {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+@inline
+fn n6_rd_be16(p: u8*) -> u16 {
+    return ((u16)p[0] << 8) | (u16)p[1];
+}
+
+@inline
+fn n6_wr_be16(p: u8*, v: u16) {
+    p[0] = (u8)(v >> 8);
+    p[1] = (u8)(v & 0xFF);
+}
+
+fn ip6_is_link_local(ip: u8*) -> bool {
+    return ip[0] == 0xFE && (ip[1] & 0xC0) == 0x80;
+}
+
+fn ip6_is_multicast(ip: u8*) -> bool {
+    return ip[0] == 0xFF;
+}
+
+fn ip6_is_ours(ip: u8*) -> bool {
+    if g_has_ll6 && n6_eq(ip, &g_ll6[0], 16) {
+        return true;
+    }
+    if g_has_global6 && n6_eq(ip, &g_global6[0], 16) {
+        return true;
+    }
+    return false;
+}
+
+fn ip6_is_solicited_node_for_us(ip: u8*) -> bool {
+    // ff02::1:ffXX:XXXX matches our MAC lower 3 bytes (same for both LL & Global EUI-64)
+    if ip[0] != 0xFF || ip[1] != 0x02 { return false; }
+    let i: usize = 2;
+    while i < 11 {
+        if ip[i] != 0 { return false; }
+        i = i + 1;
+    }
+    if ip[11] != 0x01 || ip[12] != 0xFF { return false; }
+    return ip[13] == g_net6_mac[3] && ip[14] == g_net6_mac[4] && ip[15] == g_net6_mac[5];
+}
+
+fn icmp6_checksum(src: u8*, dst: u8*, payload: u8*, len: usize) -> u16 {
+    let sum: u32 = 0;
+    let i: usize = 0;
+    while i < 16 {
+        sum = sum + (((u32)src[i] << 8) | (u32)src[i + 1]);
+        sum = sum + (((u32)dst[i] << 8) | (u32)dst[i + 1]);
+        i = i + 2;
+    }
+    sum = sum + ((u32)len >> 16) + ((u32)len & 0xFFFF);
+    sum = sum + (u32)IPV6_NEXT_ICMP6;
+
+    i = 0;
+    while i + 1 < len {
+        sum = sum + (((u32)payload[i] << 8) | (u32)payload[i + 1]);
+        i = i + 2;
+    }
+    if i < len {
+        sum = sum + ((u32)payload[i] << 8);
+    }
+    while (sum >> 16) != 0 {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+    return (u16)((~sum) & 0xFFFF);
+}
+
+// ===========================================================================
+// RFC 5952 IPv6 Parse & Format
+// ===========================================================================
+fn n6_hex_val(c: char) -> i32 {
+    if c >= '0' && c <= '9' { return (i32)c - (i32)'0'; }
+    if c >= 'a' && c <= 'f' { return (i32)c - (i32)'a' + 10; }
+    if c >= 'A' && c <= 'F' { return (i32)c - (i32)'A' + 10; }
+    return -1;
+}
+
+@used
+fn zen_ip6_parse(s: char*, out: u8*) -> bool {
+    if s == (char*)0 || out == (u8*)0 {
+        return false;
+    }
+    let words: u16[8];
+    let i: u32 = 0;
+    while i < 8 { words[i] = (u16)0; i = i + 1; }
+
+    let left_cnt: u32 = 0;
+    let right_words: u16[8];
+    let right_cnt: u32 = 0;
+    let seen_dcolon: bool = false;
+
+    let pos: usize = 0;
+    if s[pos] == ':' {
+        if s[pos + 1] != ':' {
+            return false;
+        }
+        seen_dcolon = true;
+        pos = pos + 2;
+    }
+
+    while s[pos] != '\0' && s[pos] != ' ' && s[pos] != '\t' && s[pos] != '\r' && s[pos] != '\n' {
+        if s[pos] == ':' {
+            return false;
+        }
+        let val: u32 = 0;
+        let digits: u32 = 0;
+        while n6_hex_val(s[pos]) >= 0 {
+            val = (val << 4) | (u32)n6_hex_val(s[pos]);
+            digits = digits + 1;
+            if digits > 4 {
+                return false;
+            }
+            pos = pos + 1;
+        }
+        if digits == 0 {
+            return false;
+        }
+        if !seen_dcolon {
+            if left_cnt >= 8 { return false; }
+            words[left_cnt] = (u16)val;
+            left_cnt = left_cnt + 1;
+        } else {
+            if right_cnt >= 8 { return false; }
+            right_words[right_cnt] = (u16)val;
+            right_cnt = right_cnt + 1;
+        }
+
+        if s[pos] == ':' {
+            pos = pos + 1;
+            if s[pos] == ':' {
+                if seen_dcolon {
+                    return false; // Only one "::" allowed
+                }
+                seen_dcolon = true;
+                pos = pos + 1;
+            } else if s[pos] == '\0' || s[pos] == ' ' || s[pos] == '\t' {
+                return false; // Trailing single ':'
+            }
+        } else if s[pos] != '\0' && s[pos] != ' ' && s[pos] != '\t' && s[pos] != '\r' && s[pos] != '\n' {
+            return false;
+        }
+    }
+
+    if seen_dcolon {
+        if left_cnt + right_cnt > 7 {
+            return false;
+        }
+        let dst_idx: u32 = 8 - right_cnt;
+        i = 0;
+        while i < right_cnt {
+            words[dst_idx + i] = right_words[i];
+            i = i + 1;
+        }
+    } else {
+        if left_cnt != 8 {
+            return false;
+        }
+    }
+
+    i = 0;
+    while i < 8 {
+        out[i * 2]     = (u8)(words[i] >> 8);
+        out[i * 2 + 1] = (u8)(words[i] & 0xFF);
+        i = i + 1;
+    }
+    return true;
+}
+
+@used
+fn zen_ip6_format(ip: u8*, buf: char*, cap: usize) {
+    if ip == (u8*)0 || buf == (char*)0 || cap < 4 {
+        return;
+    }
+    let words: u16[8];
+    let i: u32 = 0;
+    while i < 8 {
+        words[i] = ((u16)ip[i * 2] << 8) | (u16)ip[i * 2 + 1];
+        i = i + 1;
+    }
+
+    // Find longest run of >= 2 consecutive zero 16-bit groups (RFC 5952)
+    let best_start: i32 = -1;
+    let best_len: u32   = 0;
+    let cur_start: i32  = -1;
+    let cur_len: u32    = 0;
+    i = 0;
+    while i < 8 {
+        if words[i] == 0 {
+            if cur_start < 0 {
+                cur_start = (i32)i;
+                cur_len   = 1;
+            } else {
+                cur_len = cur_len + 1;
+            }
+            if cur_len > best_len && cur_len >= 2 {
+                best_start = cur_start;
+                best_len   = cur_len;
+            }
+        } else {
+            cur_start = -1;
+            cur_len   = 0;
+        }
+        i = i + 1;
+    }
+
+    let hex: char* = "0123456789abcdef";
+    let pos: usize = 0;
+    i = 0;
+    while i < 8 {
+        if (i32)i == best_start {
+            if pos + 2 < cap {
+                buf[pos] = ':'; pos = pos + 1;
+                buf[pos] = ':'; pos = pos + 1;
+            }
+            i = i + best_len;
+            continue;
+        }
+        if i > 0 && (best_start < 0 || (i32)i != best_start + (i32)best_len) {
+            if pos + 1 < cap { buf[pos] = ':'; pos = pos + 1; }
+        }
+        let w: u16 = words[i];
+        let started: bool = false;
+        let shift: i32 = 12;
+        while shift >= 0 {
+            let nib: u32 = ((u32)w >> (u32)shift) & 0xF;
+            if nib != 0 || started || shift == 0 {
+                if pos + 1 < cap {
+                    buf[pos] = hex[nib];
+                    pos = pos + 1;
+                }
+                started = true;
+            }
+            shift = shift - 4;
+        }
+        i = i + 1;
+    }
+    buf[pos] = '\0';
+}
+
+fn n6_print_ip6(ip: u8*) {
+    let tmp: char[40];
+    zen_ip6_format(ip, &tmp[0], 40);
+    bsp_uart_puts(&tmp[0]);
+}
+
+// ===========================================================================
+// NDP Neighbor Cache (RFC 4861)
+// ===========================================================================
+fn ndp_update(ip6: u8*, mac: u8*) {
+    let i: u32 = 0;
+    let free_idx: i32 = -1;
+    let oldest_idx: u32 = 0;
+    let oldest_age: u32 = 0;
+
+    while i < NDP_TABLE_SIZE {
+        if g_ndp_table[i].valid && n6_eq(&g_ndp_table[i].ip6[0], ip6, 16) {
+            n6_copy(&g_ndp_table[i].mac[0], mac, 6);
+            g_ndp_table[i].stamp_ms = g_net6_now_ms;
+            return;
+        }
+        if !g_ndp_table[i].valid && free_idx < 0 {
+            free_idx = (i32)i;
+        }
+        if g_ndp_table[i].valid {
+            let age: u32 = g_net6_now_ms - g_ndp_table[i].stamp_ms;
+            if age >= oldest_age {
+                oldest_age = age;
+                oldest_idx = i;
+            }
+        }
+        i = i + 1;
+    }
+
+    let slot: u32 = oldest_idx;
+    if free_idx >= 0 {
+        slot = (u32)free_idx;
+    }
+    g_ndp_table[slot].valid    = true;
+    n6_copy(&g_ndp_table[slot].ip6[0], ip6, 16);
+    n6_copy(&g_ndp_table[slot].mac[0], mac, 6);
+    g_ndp_table[slot].stamp_ms = g_net6_now_ms;
+}
+
+fn ndp_lookup(ip6: u8*, mac_out: u8*) -> bool {
+    let i: u32 = 0;
+    while i < NDP_TABLE_SIZE {
+        if g_ndp_table[i].valid && n6_eq(&g_ndp_table[i].ip6[0], ip6, 16) {
+            if (g_net6_now_ms - g_ndp_table[i].stamp_ms) <= NDP_TTL_MS {
+                n6_copy(mac_out, &g_ndp_table[i].mac[0], 6);
+                return true;
+            }
+            g_ndp_table[i].valid = false;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+// ===========================================================================
+// IPv6 & ICMPv6 Transmit
+// ===========================================================================
+fn ip6_send_direct(dst_mac: u8*, src_ip: u8*, dst_ip: u8*, next_hdr: u8,
+                   hop_limit: u8, payload: u8*, payload_len: u16) -> i32 {
+    let total_len: usize = ETH6_HDR_LEN + IPV6_HDR_LEN + (usize)payload_len;
+    if total_len > MAX6_FRAME_LEN || !g_net6_link_up {
+        return -1;
+    }
+
+    n6_copy(&g_tx6_frame[0], dst_mac, 6);
+    n6_copy(&g_tx6_frame[6], &g_net6_mac[0], 6);
+    n6_wr_be16(&g_tx6_frame[12], ETH6_TYPE_IPV6);
+
+    let iph: u8* = &g_tx6_frame[14];
+    iph[0] = (u8)0x60; // Version 6
+    iph[1] = (u8)0;
+    iph[2] = (u8)0;
+    iph[3] = (u8)0;
+    n6_wr_be16(&iph[4], payload_len);
+    iph[6] = next_hdr;
+    iph[7] = hop_limit;
+    n6_copy(&iph[8],  src_ip, 16);
+    n6_copy(&iph[24], dst_ip, 16);
+
+    if payload_len > 0 && payload != (u8*)0 {
+        n6_copy(&g_tx6_frame[54], payload, (usize)payload_len);
+    }
+    return zen_net_eth_tx_raw(&g_tx6_frame[0], (u16)total_len);
+}
+
+fn ndp_send_ns(target_ip6: u8*) {
+    if !g_has_ll6 {
+        return;
+    }
+    // Solicited-node multicast IP: ff02::1:ffXX:XXXX
+    let dst_ip: u8[16];
+    n6_zero(&dst_ip[0], 16);
+    dst_ip[0]  = (u8)0xFF;
+    dst_ip[1]  = (u8)0x02;
+    dst_ip[11] = (u8)0x01;
+    dst_ip[12] = (u8)0xFF;
+    dst_ip[13] = target_ip6[13];
+    dst_ip[14] = target_ip6[14];
+    dst_ip[15] = target_ip6[15];
+
+    let dst_mac: u8[6];
+    dst_mac[0] = (u8)0x33; dst_mac[1] = (u8)0x33;
+    dst_mac[2] = (u8)0xFF; dst_mac[3] = target_ip6[13];
+    dst_mac[4] = target_ip6[14]; dst_mac[5] = target_ip6[15];
+
+    // 24B NS header + 8B Source Link-Layer Address Option (Type=1, Len=1, MAC)
+    let ns: u8[32];
+    n6_zero(&ns[0], 32);
+    ns[0] = ICMP6_NEIGH_SOL;
+    n6_copy(&ns[8], target_ip6, 16);
+    ns[24] = (u8)1;
+    ns[25] = (u8)1;
+    n6_copy(&ns[26], &g_net6_mac[0], 6);
+
+    let csum: u16 = icmp6_checksum(&g_ll6[0], &dst_ip[0], &ns[0], 32);
+    n6_wr_be16(&ns[2], csum);
+    let _rc: i32 = ip6_send_direct(&dst_mac[0], &g_ll6[0], &dst_ip[0], IPV6_NEXT_ICMP6, (u8)255, &ns[0], (u16)32);
+}
+
+fn ndp_send_rs() {
+    if !g_has_ll6 || !g_net6_link_up {
+        return;
+    }
+    // All-routers multicast: ff02::2 -> MAC 33:33:00:00:00:02
+    let dst_ip: u8[16];
+    n6_zero(&dst_ip[0], 16);
+    dst_ip[0]  = (u8)0xFF;
+    dst_ip[1]  = (u8)0x02;
+    dst_ip[15] = (u8)0x02;
+
+    let dst_mac: u8[6] = [ 0x33, 0x33, 0x00, 0x00, 0x00, 0x02 ];
+
+    // 8B RS header + 8B Source Link-Layer Address Option
+    let rs: u8[16];
+    n6_zero(&rs[0], 16);
+    rs[0] = ICMP6_ROUTER_SOL;
+    rs[8] = (u8)1;
+    rs[9] = (u8)1;
+    n6_copy(&rs[10], &g_net6_mac[0], 6);
+
+    let csum: u16 = icmp6_checksum(&g_ll6[0], &dst_ip[0], &rs[0], 16);
+    n6_wr_be16(&rs[2], csum);
+    g_rs_last_ms = g_net6_now_ms;
+    g_rs_sent_cnt = g_rs_sent_cnt + 1;
+    let _rc: i32 = ip6_send_direct(&dst_mac[0], &g_ll6[0], &dst_ip[0], IPV6_NEXT_ICMP6, (u8)255, &rs[0], (u16)16);
+}
+
+fn ip6_select_src(dst_ip: u8*) -> u8* {
+    if ip6_is_link_local(dst_ip) || !g_has_global6 {
+        return &g_ll6[0];
+    }
+    return &g_global6[0];
+}
+
+fn ip6_send(dst_ip: u8*, next_hdr: u8, hop_limit: u8, payload: u8*, payload_len: u16) -> i32 {
+    if !g_net6_link_up || !g_has_ll6 {
+        return -1;
+    }
+    let src_ip: u8* = ip6_select_src(dst_ip);
+
+    // Multicast destination -> 33:33:dst[12..15]
+    if ip6_is_multicast(dst_ip) {
+        let mcast_mac: u8[6];
+        mcast_mac[0] = (u8)0x33; mcast_mac[1] = (u8)0x33;
+        mcast_mac[2] = dst_ip[12]; mcast_mac[3] = dst_ip[13];
+        mcast_mac[4] = dst_ip[14]; mcast_mac[5] = dst_ip[15];
+        return ip6_send_direct(&mcast_mac[0], src_ip, dst_ip, next_hdr, hop_limit, payload, payload_len);
+    }
+
+    // Determine next-hop IPv6 (on-link if link-local or matching our /64 prefix, else default router)
+    let next_hop: u8[16];
+    let on_link: bool = ip6_is_link_local(dst_ip);
+    if !on_link && g_has_global6 && n6_eq(dst_ip, &g_prefix6[0], 8) {
+        on_link = true;
+    }
+    if on_link {
+        n6_copy(&next_hop[0], dst_ip, 16);
+    } else {
+        if !g_has_gw6 {
+            return -1;
+        }
+        n6_copy(&next_hop[0], &g_gw6[0], 16);
+    }
+
+    let dst_mac: u8[6];
+    if ndp_lookup(&next_hop[0], &dst_mac[0]) {
+        return ip6_send_direct(&dst_mac[0], src_ip, dst_ip, next_hdr, hop_limit, payload, payload_len);
+    }
+
+    // Queue 1 pending packet while NDP resolves next_hop
+    let total_len: usize = ETH6_HDR_LEN + IPV6_HDR_LEN + (usize)payload_len;
+    if total_len > MAX6_FRAME_LEN {
+        return -1;
+    }
+    n6_zero(&g_pend6_frame[0], 6);
+    n6_copy(&g_pend6_frame[6], &g_net6_mac[0], 6);
+    n6_wr_be16(&g_pend6_frame[12], ETH6_TYPE_IPV6);
+    let iph: u8* = &g_pend6_frame[14];
+    iph[0] = (u8)0x60; iph[1] = (u8)0; iph[2] = (u8)0; iph[3] = (u8)0;
+    n6_wr_be16(&iph[4], payload_len);
+    iph[6] = next_hdr;
+    iph[7] = hop_limit;
+    n6_copy(&iph[8],  src_ip, 16);
+    n6_copy(&iph[24], dst_ip, 16);
+    if payload_len > 0 && payload != (u8*)0 {
+        n6_copy(&g_pend6_frame[54], payload, (usize)payload_len);
+    }
+    n6_copy(&g_pend6_hop[0], &next_hop[0], 16);
+    g_pend6_len   = (u16)total_len;
+    g_pend6_valid = true;
+
+    ndp_send_ns(&next_hop[0]);
+    return 0;
+}
+
+// ===========================================================================
+// ICMPv6 Receive Demux (Echo, NS, NA, RA)
+// ===========================================================================
+fn icmp6_rx(src_mac: u8*, src_ip: u8*, dst_ip: u8*, hlim: u8, payload: u8*, len: usize) {
+    if len < 8 {
+        return;
+    }
+    if icmp6_checksum(src_ip, dst_ip, payload, len) != 0 {
+        return;
+    }
+
+    let icmp_type: u8 = payload[0];
+
+    // 1. ICMPv6 Echo Request (128) -> Reply immediately!
+    if icmp_type == ICMP6_ECHO_REQ && payload[1] == 0 {
+        if !ip6_is_ours(dst_ip) {
+            return;
+        }
+        let rlen: usize = len;
+        if rlen > 1440 { rlen = 1440; }
+        n6_copy(&g_icmp6_reply_buf[0], payload, rlen);
+        g_icmp6_reply_buf[0] = ICMP6_ECHO_REPLY;
+        g_icmp6_reply_buf[2] = (u8)0;
+        g_icmp6_reply_buf[3] = (u8)0;
+        let csum: u16 = icmp6_checksum(dst_ip, src_ip, &g_icmp6_reply_buf[0], rlen);
+        n6_wr_be16(&g_icmp6_reply_buf[2], csum);
+        // Reply directly to src_mac so inbound ping6 works even before NDP resolves
+        let _rc: i32 = ip6_send_direct(src_mac, dst_ip, src_ip, IPV6_NEXT_ICMP6, (u8)64, &g_icmp6_reply_buf[0], (u16)rlen);
+        return;
+    }
+
+    // 2. ICMPv6 Echo Reply (129) -> Wake ping6 waiter
+    if icmp_type == ICMP6_ECHO_REPLY && payload[1] == 0 {
+        let id: u16  = n6_rd_be16(&payload[4]);
+        let seq: u16 = n6_rd_be16(&payload[6]);
+        if g_ping6_waiting && id == ICMP6_PING_ID && seq == g_ping6_expect_seq &&
+           n6_eq(src_ip, &g_ping6_expect_ip[0], 16) {
+            g_ping6_got_reply  = true;
+            g_ping6_reply_hlim = hlim;
+            g_ping6_reply_ms   = rtos::rtos_get_tick();
+            g_ping6_waiting    = false;
+            rtos::rtos_sem_signal(&g_ping6_sem);
+        }
+        return;
+    }
+
+    // 3. Neighbor Solicitation (135) -> Send Neighbor Advertisement (136)
+    if icmp_type == ICMP6_NEIGH_SOL && len >= 24 {
+        let target: u8* = &payload[8];
+        if !ip6_is_ours(target) {
+            return;
+        }
+        // Learn requester into NDP cache (unless unspecified :: source)
+        let is_unspec: bool = true;
+        let k: usize = 0;
+        while k < 16 {
+            if src_ip[k] != 0 { is_unspec = false; break; }
+            k = k + 1;
+        }
+        if !is_unspec {
+            ndp_update(src_ip, src_mac);
+        }
+
+        // Build 32-byte NA: Solicited (0x40) | Override (0x20) + Target Link-Layer Addr Opt (2)
+        let na: u8[32];
+        n6_zero(&na[0], 32);
+        na[0] = ICMP6_NEIGH_ADV;
+        if is_unspec {
+            na[4] = (u8)0x20; // Override only (DAD)
+        } else {
+            na[4] = (u8)0x60; // Solicited + Override
+        }
+        n6_copy(&na[8], target, 16);
+        na[24] = (u8)2; // Target Link-Layer Address option
+        na[25] = (u8)1;
+        n6_copy(&na[26], &g_net6_mac[0], 6);
+
+        let reply_dst: u8[16];
+        let reply_mac: u8[6];
+        if is_unspec {
+            n6_zero(&reply_dst[0], 16);
+            reply_dst[0] = (u8)0xFF; reply_dst[1] = (u8)0x02; reply_dst[15] = (u8)0x01;
+            reply_mac[0] = (u8)0x33; reply_mac[1] = (u8)0x33;
+            reply_mac[2] = (u8)0x00; reply_mac[3] = (u8)0x00;
+            reply_mac[4] = (u8)0x00; reply_mac[5] = (u8)0x01;
+        } else {
+            n6_copy(&reply_dst[0], src_ip, 16);
+            n6_copy(&reply_mac[0], src_mac, 6);
+        }
+        let csum: u16 = icmp6_checksum(target, &reply_dst[0], &na[0], 32);
+        n6_wr_be16(&na[2], csum);
+        let _rc: i32 = ip6_send_direct(&reply_mac[0], target, &reply_dst[0], IPV6_NEXT_ICMP6, (u8)255, &na[0], (u16)32);
+        return;
+    }
+
+    // 4. Neighbor Advertisement (136) -> Update NDP cache & flush pending TX
+    if icmp_type == ICMP6_NEIGH_ADV && len >= 24 {
+        let target: u8* = &payload[8];
+        let peer_mac: u8* = src_mac;
+        if len >= 32 && payload[24] == 2 && payload[25] == 1 {
+            peer_mac = &payload[26];
+        }
+        ndp_update(target, peer_mac);
+        if g_pend6_valid && n6_eq(target, &g_pend6_hop[0], 16) {
+            n6_copy(&g_pend6_frame[0], peer_mac, 6);
+            g_pend6_valid = false;
+            let _rc: i32 = zen_net_eth_tx_raw(&g_pend6_frame[0], g_pend6_len);
+        }
+        return;
+    }
+
+    // 5. Router Advertisement (134) -> SLAAC Global IPv6 + Default IPv6 Gateway
+    if icmp_type == ICMP6_ROUTER_ADV && len >= 16 {
+        let rtr_lifetime: u16 = n6_rd_be16(&payload[6]);
+        let rtr_mac: u8* = src_mac;
+
+        // Parse NDP options starting at offset 16
+        let pos: usize = 16;
+        let got_prefix: bool = false;
+        let new_prefix: u8[8];
+        while pos + 2 <= len {
+            let opt_type: u8 = payload[pos];
+            let opt_len8: usize = (usize)payload[pos + 1] * 8;
+            if opt_len8 == 0 || pos + opt_len8 > len {
+                break;
+            }
+            if opt_type == 1 && opt_len8 >= 8 {
+                // Source Link-Layer Address
+                rtr_mac = &payload[pos + 2];
+            } else if opt_type == 3 && opt_len8 >= 32 {
+                // Prefix Information: prefix_len == 64 and Autonomous (A=0x40) flag set
+                let plen: u8  = payload[pos + 2];
+                let flags: u8 = payload[pos + 3];
+                if plen == 64 && (flags & 0x40) != 0 && payload[pos + 16] != 0xFE {
+                    n6_copy(&new_prefix[0], &payload[pos + 16], 8);
+                    got_prefix = true;
+                }
+            }
+            pos = pos + opt_len8;
+        }
+
+        if rtr_lifetime > 0 && ip6_is_link_local(src_ip) {
+            n6_copy(&g_gw6[0], src_ip, 16);
+            g_has_gw6 = true;
+            ndp_update(src_ip, rtr_mac);
+        }
+
+        if got_prefix && g_has_ll6 {
+            let was_new: bool = !g_has_global6 || !n6_eq(&g_prefix6[0], &new_prefix[0], 8);
+            n6_copy(&g_prefix6[0], &new_prefix[0], 8);
+            n6_copy(&g_global6[0], &new_prefix[0], 8);
+            n6_copy(&g_global6[8], &g_ll6[8], 8); // EUI-64 Interface ID
+            g_has_global6 = true;
+            if was_new {
+                bsp_uart_puts("[net6] SLAAC global: ");
+                n6_print_ip6(&g_global6[0]);
+                bsp_uart_puts("/64\n");
+            }
+        }
+    }
+}
+
+// ===========================================================================
+// Public API (matches net/include/zen_net6.h)
+// ===========================================================================
+@used
+fn zen_net6_init(mac: u8*) {
+    if mac != (u8*)0 {
+        n6_copy(&g_net6_mac[0], mac, 6);
+        // Derive EUI-64 Link-Local address: fe80::(mac0^2)(mac1):(mac2)ff:fe(mac3):(mac4)(mac5)
+        n6_zero(&g_ll6[0], 16);
+        g_ll6[0]  = (u8)0xFE;
+        g_ll6[1]  = (u8)0x80;
+        g_ll6[8]  = g_net6_mac[0] ^ (u8)0x02;
+        g_ll6[9]  = g_net6_mac[1];
+        g_ll6[10] = g_net6_mac[2];
+        g_ll6[11] = (u8)0xFF;
+        g_ll6[12] = (u8)0xFE;
+        g_ll6[13] = g_net6_mac[3];
+        g_ll6[14] = g_net6_mac[4];
+        g_ll6[15] = g_net6_mac[5];
+        g_has_ll6 = true;
+    }
+    g_net6_link_up  = false;
+    g_has_global6   = false;
+    g_has_gw6       = false;
+    g_pend6_valid   = false;
+    g_rs_sent_cnt   = 0;
+    g_ping6_waiting = false;
+    let i: u32 = 0;
+    while i < NDP_TABLE_SIZE {
+        g_ndp_table[i].valid = false;
+        i = i + 1;
+    }
+    rtos::rtos_sem_init(&g_ping6_sem, 0, 1);
+    g_net6_inited = true;
+}
+
+@used
+fn zen_net6_set_link(up: bool) {
+    if !g_net6_inited {
+        return;
+    }
+    g_net6_link_up = up;
+    g_pend6_valid  = false;
+    g_net6_now_ms  = rtos::rtos_get_tick();
+    if up {
+        g_has_global6 = false;
+        g_has_gw6     = false;
+        g_rs_sent_cnt = 0;
+        ndp_send_rs();
+    } else {
+        g_has_global6 = false;
+        g_has_gw6     = false;
+    }
+}
+
+@used
+fn zen_net6_rx_frame(frame: u8*, len: u16) {
+    if !g_net6_inited || frame == (u8*)0 || (usize)len < ETH6_HDR_LEN + IPV6_HDR_LEN {
+        return;
+    }
+    g_net6_now_ms = rtos::rtos_get_tick();
+    let iph: u8* = &frame[14];
+    if ((iph[0] >> 4) & 0x0F) != 6 {
+        return;
+    }
+    let pay_len: usize = (usize)n6_rd_be16(&iph[4]);
+    if ETH6_HDR_LEN + IPV6_HDR_LEN + pay_len > (usize)len {
+        return;
+    }
+    let next_hdr: u8 = iph[6];
+    let hlim: u8     = iph[7];
+    let src_ip: u8*  = &iph[8];
+    let dst_ip: u8*  = &iph[24];
+
+    // Accept packets addressed to our LL/Global, All-Nodes (ff02::1), or our Solicited-Node multicast
+    let accept: bool = ip6_is_ours(dst_ip) || ip6_is_solicited_node_for_us(dst_ip);
+    if !accept && dst_ip[0] == 0xFF && dst_ip[1] == 0x02 && dst_ip[15] == 0x01 {
+        accept = true; // ff02::1 (Router Advertisements)
+    }
+    if !accept {
+        return;
+    }
+
+    if next_hdr == IPV6_NEXT_ICMP6 {
+        icmp6_rx(&frame[6], src_ip, dst_ip, hlim, &frame[54], pay_len);
+    }
+}
+
+@used
+fn zen_net6_tick(now_ms: u32) {
+    if !g_net6_inited || !g_net6_link_up {
+        return;
+    }
+    g_net6_now_ms = now_ms;
+    // Retry Router Solicitation up to 5 times (every 2s) until SLAAC Global IPv6 is bound
+    if !g_has_global6 && g_rs_sent_cnt < 5 && (now_ms - g_rs_last_ms) >= 2000 {
+        ndp_send_rs();
+    }
+}
+
+@used
+fn zen_net6_has_link_local() -> bool { return g_has_ll6; }
+
+@used
+fn zen_net6_has_global() -> bool { return g_has_global6; }
+
+@used
+fn zen_net6_has_gateway() -> bool { return g_has_gw6; }
+
+@used
+fn zen_net6_get_link_local(out: u8*) {
+    if out != (u8*)0 { n6_copy(out, &g_ll6[0], 16); }
+}
+
+@used
+fn zen_net6_get_global(out: u8*) {
+    if out != (u8*)0 { n6_copy(out, &g_global6[0], 16); }
+}
+
+@used
+fn zen_net6_get_gateway(out: u8*) {
+    if out != (u8*)0 { n6_copy(out, &g_gw6[0], 16); }
+}
+
+@used
+fn zen_net6_ndp_flush() {
+    let i: u32 = 0;
+    while i < NDP_TABLE_SIZE {
+        g_ndp_table[i].valid = false;
+        i = i + 1;
+    }
+}
+
+@used
+fn zen_net6_ndp_get_entry(idx: u32, out_ip6: u8*, out_mac: u8*, out_age_sec: u32*) -> bool {
+    if idx >= NDP_TABLE_SIZE || !g_ndp_table[idx].valid {
+        return false;
+    }
+    if out_ip6 != (u8*)0 { n6_copy(out_ip6, &g_ndp_table[idx].ip6[0], 16); }
+    if out_mac != (u8*)0 { n6_copy(out_mac, &g_ndp_table[idx].mac[0], 6); }
+    if out_age_sec != (u32*)0 {
+        *out_age_sec = (rtos::rtos_get_tick() - g_ndp_table[idx].stamp_ms) / 1000;
+    }
+    return true;
+}
+
+@used
+fn zen_net6_ping(dst_ip6: u8*, seq: u16, timeout_ms: u32,
+                 out_rtt_ms: u32*, out_hlim: u8*) -> bool {
+    if !g_net6_link_up || !g_has_ll6 || dst_ip6 == (u8*)0 {
+        return false;
+    }
+    let _dr: bool = rtos::rtos_sem_wait(&g_ping6_sem, 0);
+
+    let pkt: u8[40]; // 8B ICMPv6 Echo header + 32B payload
+    n6_zero(&pkt[0], 40);
+    pkt[0] = ICMP6_ECHO_REQ;
+    n6_wr_be16(&pkt[4], ICMP6_PING_ID);
+    n6_wr_be16(&pkt[6], seq);
+    let k: u32 = 0;
+    while k < 32 {
+        pkt[8 + k] = (u8)(0x61 + (k % 23));
+        k = k + 1;
+    }
+    let src_ip: u8* = ip6_select_src(dst_ip6);
+    let csum: u16 = icmp6_checksum(src_ip, dst_ip6, &pkt[0], 40);
+    n6_wr_be16(&pkt[2], csum);
+
+    n6_copy(&g_ping6_expect_ip[0], dst_ip6, 16);
+    g_ping6_expect_seq = seq;
+    g_ping6_got_reply  = false;
+    g_ping6_waiting    = true;
+
+    let t0: u32 = rtos::rtos_get_tick();
+    if ip6_send(dst_ip6, IPV6_NEXT_ICMP6, (u8)64, &pkt[0], (u16)40) != 0 {
+        g_ping6_waiting = false;
+        return false;
+    }
+
+    let ok: bool = rtos::rtos_sem_wait(&g_ping6_sem, timeout_ms);
+    g_ping6_waiting = false;
+    if !ok || !g_ping6_got_reply {
+        return false;
+    }
+    if out_rtt_ms != (u32*)0 {
+        *out_rtt_ms = g_ping6_reply_ms - t0;
+    }
+    if out_hlim != (u8*)0 {
+        *out_hlim = g_ping6_reply_hlim;
+    }
+    return true;
+}
