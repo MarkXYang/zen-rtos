@@ -85,6 +85,7 @@ let g_dns_ip: u32 = 0;
 
 let g_dhcp_state: u32 = 0;
 let g_dhcp_xid: u32 = 0x5A454E01;
+let g_dhcp_retries: u32 = 0;
 let g_dhcp_server_ip: u32 = 0;
 let g_dhcp_offered_ip: u32 = 0;
 let g_dhcp_last_tx_ms: u32 = 0;
@@ -538,7 +539,13 @@ fn dhcp_send_msg(msg_type: u8, req_ip: u32, server_ip: u32) {
     g_dhcp_tx_buf[2] = (u8)6; // HLEN = 6
     g_dhcp_tx_buf[3] = (u8)0; // HOPS
     wr_be32(&g_dhcp_tx_buf[4], g_dhcp_xid);
-    wr_be16(&g_dhcp_tx_buf[10], (u16)0x8000); // Broadcast flag
+    // Alternate unicast (0x0000) and broadcast (0x8000) flags across retries for maximum AP/DHCP compat
+    let flags: u16 = 0x0000;
+    if (g_dhcp_retries & 1) != 0 {
+        flags = (u16)0x8000;
+    }
+    wr_be16(&g_dhcp_tx_buf[10], flags);
+    g_dhcp_retries = g_dhcp_retries + 1;
     net_copy(&g_dhcp_tx_buf[28], &g_our_mac[0], 6);
 
     // DHCP Magic Cookie: 99.130.83.99
@@ -883,6 +890,7 @@ fn zen_net_dhcp_start() {
     g_dns_ip         = 0;
     g_dhcp_lease_sec = 0;
     g_dhcp_xid       = g_dhcp_xid + 1;
+    g_dhcp_retries   = 0;
     g_dhcp_state     = DHCP_SELECTING;
     g_now_ms         = rtos::rtos_get_tick();
     if g_link_up {

@@ -346,14 +346,6 @@ fn install_gtk_now(gtk: u8*, gtk_len: usize, key_idx: u8, rsc: u8*) -> i32 {
         return -1;
     }
     mem_copy(&key_buf[0], gtk, gtk_len);
-    if alg == WIFI_WPA_ALG_TKIP && gtk_len == 32 {
-        // IEEE 802.11i GTK KDE stores [16..23]=Auth TX (STA RX), [24..31]=Auth RX (STA TX);
-        // net80211 expects [16..23]=TX Michael key, [24..31]=RX Michael key.
-        let tmp: u8[8];
-        mem_copy(&tmp[0], &key_buf[16], 8);
-        mem_copy(&key_buf[16], &key_buf[24], 8);
-        mem_copy(&key_buf[24], &tmp[0], 8);
-    }
 
     let bcast: u8[6] = [ 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF ];
     return esp_wifi_set_sta_key_internal(alg, &bcast[0], (i32)key_idx, 0,
