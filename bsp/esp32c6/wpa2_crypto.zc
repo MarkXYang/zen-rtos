@@ -1,0 +1,502 @@
+// ZenRTOS Freestanding WPA2-PSK Cryptographic Primitives in Zen-C
+// Implements SHA-1 (FIPS 180-4), HMAC-SHA1 (RFC 2104), PBKDF2-SHA1 (RFC 2898 / IEEE 802.11i),
+// IEEE 802.11i PRF-384, and RFC 3394 AES-128 Key Unwrap.
+// Portable across both ESP32-C6 target and Linux host unit tests.
+
+// Freestanding byte helpers (no <string.h> dependency on host or target)
+fn mem_copy(dst: u8*, src: u8*, n: usize) {
+    let i: usize = 0;
+    while i < n {
+        dst[i] = src[i];
+        i = i + 1;
+    }
+}
+
+fn mem_zero(dst: u8*, n: usize) {
+    let i: usize = 0;
+    while i < n {
+        dst[i] = (u8)0;
+        i = i + 1;
+    }
+}
+
+fn str_len(s: char*) -> usize {
+    let n: usize = 0;
+    while s[n] != '\0' {
+        n = n + 1;
+    }
+    return n;
+}
+
+// ===========================================================================
+// 1. SHA-1 & HMAC-SHA1 (FIPS 180-4 / RFC 2104)
+// ===========================================================================
+struct Sha1Ctx {
+    state: u32[5];
+    bitcount: u64;
+    buf: u8[64];
+}
+
+@inline
+fn rol32(v: u32, n: u32) -> u32 {
+    return (v << n) | (v >> (32 - n));
+}
+
+@inline
+fn be32_load(p: u8*) -> u32 {
+    return ((u32)p[0] << 24) | ((u32)p[1] << 16) | ((u32)p[2] << 8) | (u32)p[3];
+}
+
+@inline
+fn be32_store(p: u8*, v: u32) {
+    p[0] = (u8)(v >> 24);
+    p[1] = (u8)(v >> 16);
+    p[2] = (u8)(v >> 8);
+    p[3] = (u8)(v & 0xFF);
+}
+
+fn sha1_transform(state: u32*, block: u8*) {
+    let w: u32[80];
+    let i: u32 = 0;
+    while i < 16 {
+        w[i] = be32_load(&block[i * 4]);
+        i = i + 1;
+    }
+    i = 16;
+    while i < 80 {
+        w[i] = rol32(w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16], 1);
+        i = i + 1;
+    }
+
+    let a: u32 = state[0];
+    let b: u32 = state[1];
+    let c: u32 = state[2];
+    let d: u32 = state[3];
+    let e: u32 = state[4];
+
+    i = 0;
+    while i < 80 {
+        let f: u32 = 0;
+        let k: u32 = 0;
+        if i < 20 {
+            f = (b & c) | ((~b) & d);
+            k = (u32)0x5A827999;
+        } else if i < 40 {
+            f = b ^ c ^ d;
+            k = (u32)0x6ED9EBA1;
+        } else if i < 60 {
+            f = (b & c) | (b & d) | (c & d);
+            k = (u32)0x8F1BBCDC;
+        } else {
+            f = b ^ c ^ d;
+            k = (u32)0xCA62C1D6;
+        }
+        let tmp: u32 = rol32(a, 5) + f + e + k + w[i];
+        e = d;
+        d = c;
+        c = rol32(b, 30);
+        b = a;
+        a = tmp;
+        i = i + 1;
+    }
+
+    state[0] = state[0] + a;
+    state[1] = state[1] + b;
+    state[2] = state[2] + c;
+    state[3] = state[3] + d;
+    state[4] = state[4] + e;
+}
+
+fn sha1_init(ctx: Sha1Ctx*) {
+    ctx.state[0] = (u32)0x67452301;
+    ctx.state[1] = (u32)0xEFCDAB89;
+    ctx.state[2] = (u32)0x98BADCFE;
+    ctx.state[3] = (u32)0x10325476;
+    ctx.state[4] = (u32)0xC3D2E1F0;
+    ctx.bitcount = 0;
+}
+
+fn sha1_update(ctx: Sha1Ctx*, data: u8*, len: usize) {
+    let idx: usize = (usize)((ctx.bitcount >> 3) & 63);
+    ctx.bitcount = ctx.bitcount + ((u64)len << 3);
+    let i: usize = 0;
+    if idx > 0 {
+        let fill: usize = 64 - idx;
+        if len < fill {
+            mem_copy(&ctx.buf[idx], data, len);
+            return;
+        }
+        mem_copy(&ctx.buf[idx], data, fill);
+        sha1_transform(&ctx.state[0], &ctx.buf[0]);
+        i = i + fill;
+    }
+    while i + 64 <= len {
+        sha1_transform(&ctx.state[0], &data[i]);
+        i = i + 64;
+    }
+    if i < len {
+        mem_copy(&ctx.buf[0], &data[i], len - i);
+    }
+}
+
+fn sha1_final(ctx: Sha1Ctx*, digest: u8*) {
+    let bits: u64 = ctx.bitcount;
+    let pad: u8 = 0x80;
+    sha1_update(ctx, &pad, 1);
+    let zero: u8 = 0;
+    while ((ctx.bitcount >> 3) & 63) != 56 {
+        sha1_update(ctx, &zero, 1);
+    }
+    let len_be: u8[8];
+    be32_store(&len_be[0], (u32)(bits >> 32));
+    be32_store(&len_be[4], (u32)(bits & 0xFFFFFFFF));
+    sha1_update(ctx, &len_be[0], 8);
+    let i: u32 = 0;
+    while i < 5 {
+        be32_store(&digest[i * 4], ctx.state[i]);
+        i = i + 1;
+    }
+}
+
+@used
+fn wpa2_sha1_vec(num_elem: usize, addr: u8**, len: usize*, mac: u8*) {
+    let ctx: Sha1Ctx;
+    sha1_init(&ctx);
+    let i: usize = 0;
+    while i < num_elem {
+        if addr[i] != (u8*)0 && len[i] > 0 {
+            sha1_update(&ctx, addr[i], len[i]);
+        }
+        i = i + 1;
+    }
+    sha1_final(&ctx, mac);
+}
+
+@used
+fn wpa2_hmac_sha1_vec(key: u8*, key_len: usize,
+                      num_elem: usize, addr: u8**, len: usize*,
+                      mac: u8*) {
+    let k_pad: u8[64];
+    let tk: u8[20];
+    let use_key: u8* = key;
+    let use_len: usize = key_len;
+
+    if use_len > 64 {
+        let ka: u8*[1];
+        let kl: usize[1];
+        ka[0] = use_key;
+        kl[0] = use_len;
+        wpa2_sha1_vec(1, &ka[0], &kl[0], &tk[0]);
+        use_key = &tk[0];
+        use_len = 20;
+    }
+
+    mem_zero(&k_pad[0], 64);
+    mem_copy(&k_pad[0], use_key, use_len);
+    let i: u32 = 0;
+    while i < 64 {
+        k_pad[i] = k_pad[i] ^ (u8)0x36;
+        i = i + 1;
+    }
+
+    let ctx: Sha1Ctx;
+    sha1_init(&ctx);
+    sha1_update(&ctx, &k_pad[0], 64);
+    let idx: usize = 0;
+    while idx < num_elem {
+        if addr[idx] != (u8*)0 && len[idx] > 0 {
+            sha1_update(&ctx, addr[idx], len[idx]);
+        }
+        idx = idx + 1;
+    }
+    let inner: u8[20];
+    sha1_final(&ctx, &inner[0]);
+
+    mem_zero(&k_pad[0], 64);
+    mem_copy(&k_pad[0], use_key, use_len);
+    i = 0;
+    while i < 64 {
+        k_pad[i] = k_pad[i] ^ (u8)0x5C;
+        i = i + 1;
+    }
+
+    sha1_init(&ctx);
+    sha1_update(&ctx, &k_pad[0], 64);
+    sha1_update(&ctx, &inner[0], 20);
+    sha1_final(&ctx, mac);
+}
+
+@used
+fn wpa2_hmac_sha1(key: u8*, key_len: usize,
+                  data: u8*, data_len: usize,
+                  mac: u8*) {
+    let a: u8*[1];
+    let l: usize[1];
+    a[0] = data;
+    l[0] = data_len;
+    wpa2_hmac_sha1_vec(key, key_len, 1, &a[0], &l[0], mac);
+}
+
+// ===========================================================================
+// 2. PBKDF2-HMAC-SHA1 (RFC 2898 / IEEE 802.11i) & PRF-384
+// ===========================================================================
+fn pbkdf2_sha1_f(pass: u8*, pass_len: usize,
+                 ssid: u8*, ssid_len: usize,
+                 iterations: u32, count: u32, digest: u8*) {
+    let cnt_be: u8[4];
+    be32_store(&cnt_be[0], count);
+    let a: u8*[2];
+    let l: usize[2];
+    a[0] = ssid;
+    a[1] = &cnt_be[0];
+    l[0] = ssid_len;
+    l[1] = 4;
+
+    let tmp: u8[20];
+    wpa2_hmac_sha1_vec(pass, pass_len, 2, &a[0], &l[0], &tmp[0]);
+    mem_copy(digest, &tmp[0], 20);
+
+    let i: u32 = 1;
+    while i < iterations {
+        let tmp2: u8[20];
+        wpa2_hmac_sha1(pass, pass_len, &tmp[0], 20, &tmp2[0]);
+        mem_copy(&tmp[0], &tmp2[0], 20);
+        let j: u32 = 0;
+        while j < 20 {
+            digest[j] = digest[j] ^ tmp[j];
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+}
+
+@used
+fn wpa2_pbkdf2_sha1(passphrase: char*, ssid: u8*, ssid_len: usize,
+                    iterations: u32, buf: u8*, buflen: usize) {
+    let pass_len: usize = str_len(passphrase);
+    let count: u32 = 1;
+    let pos: usize = 0;
+    let left: usize = buflen;
+    while left > 0 {
+        let digest: u8[20];
+        pbkdf2_sha1_f((u8*)passphrase, pass_len, ssid, ssid_len, iterations, count, &digest[0]);
+        let take: usize = left;
+        if take > 20 {
+            take = 20;
+        }
+        mem_copy(&buf[pos], &digest[0], take);
+        pos = pos + take;
+        left = left - take;
+        count = count + 1;
+    }
+}
+
+@used
+fn wpa2_prf_384(pmk: u8*, label: char*,
+                data: u8*, data_len: usize,
+                out: u8*) {
+    let zero: u8 = 0;
+    let counter: u8 = 0;
+    let label_len: usize = str_len(label);
+    let a: u8*[4];
+    let l: usize[4];
+    a[0] = (u8*)label;
+    a[1] = &zero;
+    a[2] = data;
+    a[3] = &counter;
+    l[0] = label_len;
+    l[1] = 1;
+    l[2] = data_len;
+    l[3] = 1;
+
+    let pos: usize = 0;
+    while pos < 48 {
+        let hash: u8[20];
+        wpa2_hmac_sha1_vec(pmk, 32, 4, &a[0], &l[0], &hash[0]);
+        let take: usize = 48 - pos;
+        if take > 20 {
+            take = 20;
+        }
+        mem_copy(&out[pos], &hash[0], take);
+        pos = pos + take;
+        counter = counter + (u8)1;
+    }
+}
+
+// ===========================================================================
+// 3. Compact AES-128 Decryption & RFC 3394 Key Unwrap (for GTK in EAPOL Msg 3)
+// ===========================================================================
+let s_aes_sbox: u8[256] = [
+    0x63,0x7c,0x77,0x7b,0xf2,0x6b,0x6f,0xc5,0x30,0x01,0x67,0x2b,0xfe,0xd7,0xab,0x76,
+    0xca,0x82,0xc9,0x7d,0xfa,0x59,0x47,0xf0,0xad,0xd4,0xa2,0xaf,0x9c,0xa4,0x72,0xc0,
+    0xb7,0xfd,0x93,0x26,0x36,0x3f,0xf7,0xcc,0x34,0xa5,0xe5,0xf1,0x71,0xd8,0x31,0x15,
+    0x04,0xc7,0x23,0xc3,0x18,0x96,0x05,0x9a,0x07,0x12,0x80,0xe2,0xeb,0x27,0xb2,0x75,
+    0x09,0x83,0x2c,0x1a,0x1b,0x6e,0x5a,0xa0,0x52,0x3b,0xd6,0xb3,0x29,0xe3,0x2f,0x84,
+    0x53,0xd1,0x00,0xed,0x20,0xfc,0xb1,0x5b,0x6a,0xcb,0xbe,0x39,0x4a,0x4c,0x58,0xcf,
+    0xd0,0xef,0xaa,0xfb,0x43,0x4d,0x33,0x85,0x45,0xf9,0x02,0x7f,0x50,0x3c,0x9f,0xa8,
+    0x51,0xa3,0x40,0x8f,0x92,0x9d,0x38,0xf5,0xbc,0xb6,0xda,0x21,0x10,0xff,0xf3,0xd2,
+    0xcd,0x0c,0x13,0xec,0x5f,0x97,0x44,0x17,0xc4,0xa7,0x7e,0x3d,0x64,0x5d,0x19,0x73,
+    0x60,0x81,0x4f,0xdc,0x22,0x2a,0x90,0x88,0x46,0xee,0xb8,0x14,0xde,0x5e,0x0b,0xdb,
+    0xe0,0x32,0x3a,0x0a,0x49,0x06,0x24,0x5c,0xc2,0xd3,0xac,0x62,0x91,0x95,0xe4,0x79,
+    0xe7,0xc8,0x37,0x6d,0x8d,0xd5,0x4e,0xa9,0x6c,0x56,0xf4,0xea,0x65,0x7a,0xae,0x08,
+    0xba,0x78,0x25,0x2e,0x1c,0xa6,0xb4,0xc6,0xe8,0xdd,0x74,0x1f,0x4b,0xbd,0x8b,0x8a,
+    0x70,0x3e,0xb5,0x66,0x48,0x03,0xf6,0x0e,0x61,0x35,0x57,0xb9,0x86,0xc1,0x1d,0x9e,
+    0xe1,0xf8,0x98,0x11,0x69,0xd9,0x8e,0x94,0x9b,0x1e,0x87,0xe9,0xce,0x55,0x28,0xdf,
+    0x8c,0xa1,0x89,0x0d,0xbf,0xe6,0x42,0x68,0x41,0x99,0x2d,0x0f,0xb0,0x54,0xbb,0x16
+];
+
+let s_aes_rsbox: u8[256] = [
+    0x52,0x09,0x6a,0xd5,0x30,0x36,0xa5,0x38,0xbf,0x40,0xa3,0x9e,0x81,0xf3,0xd7,0xfb,
+    0x7c,0xe3,0x39,0x82,0x9b,0x2f,0xff,0x87,0x34,0x8e,0x43,0x44,0xc4,0xde,0xe9,0xcb,
+    0x54,0x7b,0x94,0x32,0xa6,0xc2,0x23,0x3d,0xee,0x4c,0x95,0x0b,0x42,0xfa,0xc3,0x4e,
+    0x08,0x2e,0xa1,0x66,0x28,0xd9,0x24,0xb2,0x76,0x5b,0xa2,0x49,0x6d,0x8b,0xd1,0x25,
+    0x72,0xf8,0xf6,0x64,0x86,0x68,0x98,0x16,0xd4,0xa4,0x5c,0xcc,0x5d,0x65,0xb6,0x92,
+    0x6c,0x70,0x48,0x50,0xfd,0xed,0xb9,0xda,0x5e,0x15,0x46,0x57,0xa7,0x8d,0x9d,0x84,
+    0x90,0xd8,0xab,0x00,0x8c,0xbc,0xd3,0x0a,0xf7,0xe4,0x58,0x05,0xb8,0xb3,0x45,0x06,
+    0xd0,0x2c,0x1e,0x8f,0xca,0x3f,0x0f,0x02,0xc1,0xaf,0xbd,0x03,0x01,0x13,0x8a,0x6b,
+    0x3a,0x91,0x11,0x41,0x4f,0x67,0xdc,0xea,0x97,0xf2,0xcf,0xce,0xf0,0xb4,0xe6,0x73,
+    0x96,0xac,0x74,0x22,0xe7,0xad,0x35,0x85,0xe2,0xf9,0x37,0xe8,0x1c,0x75,0xdf,0x6e,
+    0x47,0xf1,0x1a,0x71,0x1d,0x29,0xc5,0x89,0x6f,0xb7,0x62,0x0e,0xaa,0x18,0xbe,0x1b,
+    0xfc,0x56,0x3e,0x4b,0xc6,0xd2,0x79,0x20,0x9a,0xdb,0xc0,0xfe,0x78,0xcd,0x5a,0xf4,
+    0x1f,0xdd,0xa8,0x33,0x88,0x07,0xc7,0x31,0xb1,0x12,0x10,0x59,0x27,0x80,0xec,0x5f,
+    0x60,0x51,0x7f,0xa9,0x19,0xb5,0x4a,0x0d,0x2d,0xe5,0x7a,0x9f,0x93,0xc9,0x9c,0xef,
+    0xa0,0xe0,0x3b,0x4d,0xae,0x2a,0xf5,0xb0,0xc8,0xeb,0xbb,0x3c,0x83,0x53,0x99,0x61,
+    0x17,0x2b,0x04,0x7e,0xba,0x77,0xd6,0x26,0xe1,0x69,0x14,0x63,0x55,0x21,0x0c,0x7d
+];
+
+let s_aes_rcon: u8[10] = [
+    0x01,0x02,0x04,0x08,0x10,0x20,0x40,0x80,0x1b,0x36
+];
+
+@inline
+fn gf_xtime(x: u8) -> u8 {
+    let hi: u8 = 0;
+    if (x & 0x80) != 0 {
+        hi = (u8)0x1B;
+    }
+    return (u8)(((u32)x << 1) ^ (u32)hi);
+}
+
+fn gf_mul(a_in: u8, b_in: u8) -> u8 {
+    let a: u8 = a_in;
+    let b: u8 = b_in;
+    let res: u8 = 0;
+    while b != 0 {
+        if (b & 1) != 0 {
+            res = res ^ a;
+        }
+        a = gf_xtime(a);
+        b = b >> 1;
+    }
+    return res;
+}
+
+fn aes128_key_expand(key: u8*, rk: u8*) {
+    mem_copy(rk, key, 16);
+    let i: u32 = 4;
+    while i < 44 {
+        let t: u8[4];
+        mem_copy(&t[0], &rk[(i - 1) * 4], 4);
+        if (i & 3) == 0 {
+            let tmp: u8 = t[0];
+            t[0] = s_aes_sbox[t[1]] ^ s_aes_rcon[(i / 4) - 1];
+            t[1] = s_aes_sbox[t[2]];
+            t[2] = s_aes_sbox[t[3]];
+            t[3] = s_aes_sbox[tmp];
+        }
+        let j: u32 = 0;
+        while j < 4 {
+            rk[i * 4 + j] = rk[(i - 4) * 4 + j] ^ t[j];
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+}
+
+fn aes128_decrypt_block(rk: u8*, inp: u8*, outp: u8*) {
+    let s: u8[16];
+    let i: u32 = 0;
+    while i < 16 {
+        s[i] = inp[i] ^ rk[160 + i];
+        i = i + 1;
+    }
+
+    let round: i32 = 9;
+    while round >= 0 {
+        // InvShiftRows
+        let t: u8 = s[13];
+        s[13] = s[9];  s[9]  = s[5];  s[5]  = s[1];  s[1]  = t;
+        t = s[2];  s[2]  = s[10]; s[10] = t;
+        t = s[6];  s[6]  = s[14]; s[14] = t;
+        t = s[3];  s[3]  = s[7];  s[7]  = s[11]; s[11] = s[15]; s[15] = t;
+
+        // InvSubBytes + AddRoundKey
+        let r_off: u32 = (u32)round * 16;
+        i = 0;
+        while i < 16 {
+            s[i] = s_aes_rsbox[s[i]] ^ rk[r_off + i];
+            i = i + 1;
+        }
+
+        // InvMixColumns (skip on final round 0)
+        if round > 0 {
+            let c: u32 = 0;
+            while c < 4 {
+                let a0: u8 = s[c * 4 + 0];
+                let a1: u8 = s[c * 4 + 1];
+                let a2: u8 = s[c * 4 + 2];
+                let a3: u8 = s[c * 4 + 3];
+                s[c * 4 + 0] = gf_mul(a0, (u8)14) ^ gf_mul(a1, (u8)11) ^ gf_mul(a2, (u8)13) ^ gf_mul(a3, (u8)9);
+                s[c * 4 + 1] = gf_mul(a0, (u8)9)  ^ gf_mul(a1, (u8)14) ^ gf_mul(a2, (u8)11) ^ gf_mul(a3, (u8)13);
+                s[c * 4 + 2] = gf_mul(a0, (u8)13) ^ gf_mul(a1, (u8)9)  ^ gf_mul(a2, (u8)14) ^ gf_mul(a3, (u8)11);
+                s[c * 4 + 3] = gf_mul(a0, (u8)11) ^ gf_mul(a1, (u8)13) ^ gf_mul(a2, (u8)9)  ^ gf_mul(a3, (u8)14);
+                c = c + 1;
+            }
+        }
+        round = round - 1;
+    }
+    mem_copy(outp, &s[0], 16);
+}
+
+@used
+fn wpa2_aes_unwrap(kek: u8*, n_blocks: usize, cipher: u8*, plain: u8*) -> i32 {
+    if n_blocks == 0 || cipher == (u8*)0 || plain == (u8*)0 {
+        return -1;
+    }
+    let rk: u8[176];
+    aes128_key_expand(kek, &rk[0]);
+
+    let a: u8[8];
+    mem_copy(&a[0], cipher, 8);
+    mem_copy(plain, &cipher[8], n_blocks * 8);
+
+    let j: i32 = 5;
+    while j >= 0 {
+        let i: i32 = (i32)n_blocks;
+        while i >= 1 {
+            let t: u64 = (u64)n_blocks * (u64)j + (u64)i;
+            let b: u8[16];
+            mem_copy(&b[0], &a[0], 8);
+            b[7] = b[7] ^ (u8)(t & 0xFF);
+            b[6] = b[6] ^ (u8)((t >> 8) & 0xFF);
+            b[5] = b[5] ^ (u8)((t >> 16) & 0xFF);
+            b[4] = b[4] ^ (u8)((t >> 24) & 0xFF);
+            let off: usize = (usize)(i - 1) * 8;
+            mem_copy(&b[8], &plain[off], 8);
+            aes128_decrypt_block(&rk[0], &b[0], &b[0]);
+            mem_copy(&a[0], &b[0], 8);
+            mem_copy(&plain[off], &b[8], 8);
+            i = i - 1;
+        }
+        j = j - 1;
+    }
+
+    let k: u32 = 0;
+    while k < 8 {
+        if a[k] != 0xA6 {
+            return -1;
+        }
+        k = k + 1;
+    }
+    return 0;
+}

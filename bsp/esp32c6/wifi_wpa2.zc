@@ -1,0 +1,743 @@
+// ZenRTOS ESP32-C6 WPA2-PSK STA Supplicant & 4-Way EAPOL State Machine in Zen-C
+// Implements RSN/WPA1 IE parsing & construction, PMK caching, 4-Way Handshake
+// (EAPOL 1/4..4/4), deferred PTK+GTK installation on Msg 4 TX-done, and GTK rekey.
+
+// BSP UART helpers
+extern fn bsp_uart_puts(s: char*);
+extern fn bsp_uart_putc(c: char);
+
+// Freestanding byte helpers shared from bsp/esp32c6/wpa2_crypto.zc
+extern fn mem_copy(dst: u8*, src: u8*, n: usize);
+extern fn mem_zero(dst: u8*, n: usize);
+extern fn str_len(s: char*) -> usize;
+
+fn mem_cmp(a: u8*, b: u8*, n: usize) -> i32 {
+    let i: usize = 0;
+    while i < n {
+        if a[i] != b[i] {
+            return (i32)a[i] - (i32)b[i];
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// WPA2 Cryptographic Primitives (bsp/esp32c6/wpa2_crypto.zc)
+extern fn wpa2_hmac_sha1(key: u8*, key_len: usize, data: u8*, data_len: usize, mac: u8*);
+extern fn wpa2_pbkdf2_sha1(passphrase: char*, ssid: u8*, ssid_len: usize,
+                           iterations: u32, buf: u8*, buflen: usize);
+extern fn wpa2_prf_384(pmk: u8*, label: char*, data: u8*, data_len: usize, out: u8*);
+extern fn wpa2_aes_unwrap(kek: u8*, n_blocks: usize, cipher: u8*, plain: u8*) -> i32;
+
+// Espressif libnet80211 internal STA & key hooks
+struct WifiSsidCompat {
+    len: i32;
+    ssid: u8[32];
+}
+
+// Binary-compatible with wifi_wpa_ie_t in wifi_wpa2.h
+struct WifiWpaIe {
+    proto: i32;
+    pairwise_cipher: i32;
+    group_cipher: i32;
+    key_mgmt: i32;
+    capabilities: i32;
+    num_pmkid: usize;
+    pmkid: u8*;
+    mgmt_group_cipher: i32;
+    rsnxe_capa: u8;
+}
+
+extern fn esp_wifi_sta_connect_internal(bssid: u8*) -> i32;
+extern fn esp_wifi_set_appie_internal(ie_type: u8, ie: u8*, len: u16, flag: u8) -> i32;
+extern fn esp_wifi_register_eapol_txdonecb_internal(cb: void*) -> i32;
+extern fn esp_wifi_set_sta_key_internal(alg: i32, addr: u8*, key_idx: i32, set_tx: i32,
+                                        seq: u8*, seq_len: usize, key: u8*, key_len: usize,
+                                        key_flag: u32) -> i32;
+extern fn esp_wifi_auth_done_internal() -> bool;
+extern fn esp_wifi_sta_get_prof_ssid_internal() -> WifiSsidCompat*;
+extern fn esp_wifi_sta_get_prof_password_internal() -> u8*;
+extern fn esp_wifi_sta_get_pairwise_cipher_internal() -> u8;
+extern fn esp_wifi_sta_get_group_cipher_internal() -> u8;
+extern fn esp_wifi_sta_prof_is_wpa_internal() -> bool;
+extern fn esp_wifi_sta_prof_is_rsn_internal() -> bool;
+extern fn esp_wifi_internal_tx(ifx: i32, buffer: void*, len: u16) -> i32;
+extern fn wifi_drv_read_mac(mac_out: u8*);
+
+// Constants
+def WIFI_IF_STA: i32                  = 0;
+
+def WIFI_CIPHER_TYPE_WEP40: i32       = 1;
+def WIFI_CIPHER_TYPE_WEP104: i32      = 2;
+def WIFI_CIPHER_TYPE_TKIP: i32        = 3;
+def WIFI_CIPHER_TYPE_CCMP: i32        = 4;
+def WIFI_CIPHER_TYPE_TKIP_CCMP: i32   = 5;
+def WIFI_CIPHER_TYPE_AES_CMAC128: i32 = 6;
+
+def WIFI_WPA_ALG_TKIP: i32            = 2;
+def WIFI_WPA_ALG_CCMP: i32            = 3;
+
+def WIFI_APPIE_WPA: u8                = 3;
+def WIFI_APPIE_RSN: u8                = 4;
+
+def KEY_FLAG_RX: u32                  = 4;
+def KEY_FLAG_TX: u32                  = 8;
+def KEY_FLAG_GROUP: u32               = 16;
+def KEY_FLAG_PAIRWISE: u32            = 32;
+
+// libnet80211 internal rsn_cipher enum (1=TKIP, 3=CCMP) — differs from public wifi_cipher_type_t!
+def NET80211_CIPHER_TKIP: u8          = 1;
+def NET80211_CIPHER_CCMP: u8          = 3;
+
+def LP_WDEV_RNG_DATA_ADDR: u32        = 0x600B2800;
+
+// Supplicant State
+let s_sta_mac: u8[6];
+let s_ap_bssid: u8[6];
+let s_pmk: u8[32];
+let s_cached_ssid: char[33];
+let s_cached_pass: char[65];
+let s_pmk_valid: bool = false;
+let s_snonce: u8[32];
+let s_ptk: u8[48]; // KCK[16] | KEK[16] | TK[16]
+let s_in_4way: bool = false;
+let s_ptk_installed: bool = false;
+let s_waiting_m4_txdone: bool = false;
+let s_pending_ptk_install: bool = false;
+let s_has_pending_gtk: bool = false;
+let s_pending_gtk: u8[32];
+let s_pending_gtk_len: usize = 0;
+let s_pending_gtk_idx: u8 = 0;
+let s_pending_gtk_rsc: u8[6];
+let s_assoc_ie: u8[24];
+let s_assoc_ie_len: u16 = 0;
+
+let s_wpa1_ie_tmpl: u8[24] = [
+    0xDD, 0x16,
+    0x00, 0x50, 0xF2, 0x01,
+    0x01, 0x00,
+    0x00, 0x50, 0xF2, 0x02, // [11] = group cipher
+    0x01, 0x00,
+    0x00, 0x50, 0xF2, 0x04, // [17] = pairwise cipher
+    0x01, 0x00,
+    0x00, 0x50, 0xF2, 0x02  // PSK AKM
+];
+
+let s_rsn_ie_tmpl: u8[22] = [
+    0x30, 0x14,
+    0x01, 0x00,
+    0x00, 0x0F, 0xAC, 0x04, // [7]  = group cipher suite
+    0x01, 0x00,
+    0x00, 0x0F, 0xAC, 0x04, // [13] = pairwise cipher suite
+    0x01, 0x00,
+    0x00, 0x0F, 0xAC, 0x02, // PSK AKM (HMAC-SHA1)
+    0x00, 0x00              // RSN capabilities
+];
+
+@inline
+fn wpa2_mmio_read32(_addr: u32) -> u32 {
+    let val: u32 = 0;
+    raw { val = *(volatile uint32_t *)(uintptr_t)_addr; }
+    return val;
+}
+
+fn wpa2_put_hex_byte(b: u8) {
+    let hex: char* = "0123456789ABCDEF";
+    bsp_uart_putc(hex[(b >> 4) & 0xF]);
+    bsp_uart_putc(hex[b & 0xF]);
+}
+
+fn wpa2_put_mac(mac: u8*) {
+    let i: u32 = 0;
+    while i < 6 {
+        wpa2_put_hex_byte(mac[i]);
+        if i < 5 {
+            bsp_uart_putc(':');
+        }
+        i = i + 1;
+    }
+}
+
+fn fill_random_bytes(buf: u8*, len: usize) {
+    let i: usize = 0;
+    while i < len {
+        buf[i] = (u8)(wpa2_mmio_read32(LP_WDEV_RNG_DATA_ADDR) & 0xFF);
+        i = i + 1;
+    }
+}
+
+fn hex_nibble(c: char) -> i32 {
+    if c >= '0' && c <= '9' {
+        return (i32)c - (i32)'0';
+    }
+    if c >= 'a' && c <= 'f' {
+        return (i32)c - (i32)'a' + 10;
+    }
+    if c >= 'A' && c <= 'F' {
+        return (i32)c - (i32)'A' + 10;
+    }
+    return -1;
+}
+
+fn try_parse_hex_pmk(s: char*, out: u8*) -> bool {
+    let i: u32 = 0;
+    while i < 32 {
+        let hi: i32 = hex_nibble(s[i * 2]);
+        let lo: i32 = hex_nibble(s[i * 2 + 1]);
+        if hi < 0 || lo < 0 {
+            return false;
+        }
+        out[i] = (u8)((hi << 4) | lo);
+        i = i + 1;
+    }
+    return true;
+}
+
+fn cipher_oui_to_wifi_cipher(suite_type: u8) -> i32 {
+    if suite_type == 1 { return WIFI_CIPHER_TYPE_WEP40; }
+    if suite_type == 2 { return WIFI_CIPHER_TYPE_TKIP; }
+    if suite_type == 4 { return WIFI_CIPHER_TYPE_CCMP; }
+    if suite_type == 5 { return WIFI_CIPHER_TYPE_WEP104; }
+    if suite_type == 6 { return WIFI_CIPHER_TYPE_AES_CMAC128; }
+    return WIFI_CIPHER_TYPE_CCMP;
+}
+
+@used
+fn wifi_wpa2_parse_wpa_ie(ie: u8*, ie_len: usize, data: WifiWpaIe*) -> i32 {
+    if ie == (u8*)0 || data == (WifiWpaIe*)0 || ie_len < 4 {
+        return -1;
+    }
+    mem_zero((u8*)data, sizeof(WifiWpaIe));
+
+    // IEEE 802.11i RSN IE
+    if ie[0] == 0x30 && ie_len >= 8 {
+        let ver: u16 = (u16)ie[2] | ((u16)ie[3] << 8);
+        if ver != 1 {
+            return -1;
+        }
+        data.proto           = 2; // WPA_PROTO_RSN
+        data.group_cipher    = cipher_oui_to_wifi_cipher(ie[7]);
+        data.pairwise_cipher = WIFI_CIPHER_TYPE_CCMP;
+        data.key_mgmt        = 2; // default WPA_KEY_MGMT_PSK
+
+        let pos: usize = 8;
+        if pos + 2 <= ie_len {
+            let pc_cnt: u16 = (u16)ie[pos] | ((u16)ie[pos + 1] << 8);
+            pos = pos + 2;
+            let has_ccmp: bool = false;
+            let has_tkip: bool = false;
+            let i: u16 = 0;
+            while i < pc_cnt && pos + 4 <= ie_len {
+                if ie[pos] == 0x00 && ie[pos + 1] == 0x0F && ie[pos + 2] == 0xAC {
+                    if ie[pos + 3] == 4 {
+                        has_ccmp = true;
+                    } else if ie[pos + 3] == 2 {
+                        has_tkip = true;
+                    }
+                }
+                i = i + 1;
+                pos = pos + 4;
+            }
+            if has_ccmp && has_tkip {
+                data.pairwise_cipher = WIFI_CIPHER_TYPE_TKIP_CCMP;
+            } else if has_ccmp {
+                data.pairwise_cipher = WIFI_CIPHER_TYPE_CCMP;
+            } else if has_tkip {
+                data.pairwise_cipher = WIFI_CIPHER_TYPE_TKIP;
+            }
+        }
+        if pos + 2 <= ie_len {
+            let akm_cnt: u16 = (u16)ie[pos] | ((u16)ie[pos + 1] << 8);
+            pos = pos + 2;
+            let akm_mask: i32 = 0;
+            let i: u16 = 0;
+            while i < akm_cnt && pos + 4 <= ie_len {
+                if ie[pos] == 0x00 && ie[pos + 1] == 0x0F && ie[pos + 2] == 0xAC {
+                    let st: u8 = ie[pos + 3];
+                    if st == 1       { akm_mask = akm_mask | (1 << 0); }  // IEEE8021X
+                    else if st == 2  { akm_mask = akm_mask | (1 << 1); }  // PSK
+                    else if st == 6  { akm_mask = akm_mask | (1 << 8); }  // PSK_SHA256
+                    else if st == 8  { akm_mask = akm_mask | (1 << 10); } // SAE
+                    else if st == 18 { akm_mask = akm_mask | (1 << 22); } // OWE
+                }
+                i = i + 1;
+                pos = pos + 4;
+            }
+            if akm_mask != 0 {
+                data.key_mgmt = akm_mask;
+            }
+        }
+        if pos + 2 <= ie_len {
+            data.capabilities = (i32)((u16)ie[pos] | ((u16)ie[pos + 1] << 8));
+            pos = pos + 2;
+        }
+        if pos + 2 <= ie_len {
+            let pmkid_cnt: u16 = (u16)ie[pos] | ((u16)ie[pos + 1] << 8);
+            pos = pos + 2;
+            if pmkid_cnt > 0 && pos + (usize)pmkid_cnt * 16 <= ie_len {
+                data.num_pmkid = (usize)pmkid_cnt;
+                data.pmkid = &ie[pos];
+                pos = pos + (usize)pmkid_cnt * 16;
+            }
+        }
+        if pos + 4 <= ie_len && ie[pos] == 0x00 && ie[pos + 1] == 0x0F && ie[pos + 2] == 0xAC {
+            data.mgmt_group_cipher = cipher_oui_to_wifi_cipher(ie[pos + 3]);
+        }
+        return 0;
+    }
+
+    // Microsoft WPA1 IE
+    if ie[0] == 0xDD && ie_len >= 12 &&
+       ie[2] == 0x00 && ie[3] == 0x50 && ie[4] == 0xF2 && ie[5] == 0x01 {
+        data.proto           = 1; // WPA_PROTO_WPA
+        data.group_cipher    = cipher_oui_to_wifi_cipher(ie[11]);
+        data.pairwise_cipher = WIFI_CIPHER_TYPE_TKIP;
+        data.key_mgmt        = 2; // WPA_KEY_MGMT_PSK
+        if ie_len >= 18 {
+            let pc_cnt: u16 = (u16)ie[12] | ((u16)ie[13] << 8);
+            let pos: usize = 14;
+            let has_ccmp: bool = false;
+            let has_tkip: bool = false;
+            let i: u16 = 0;
+            while i < pc_cnt && pos + 4 <= ie_len {
+                if ie[pos + 3] == 4 {
+                    has_ccmp = true;
+                } else if ie[pos + 3] == 2 {
+                    has_tkip = true;
+                }
+                i = i + 1;
+                pos = pos + 4;
+            }
+            if has_ccmp && has_tkip {
+                data.pairwise_cipher = WIFI_CIPHER_TYPE_TKIP_CCMP;
+            } else if has_ccmp {
+                data.pairwise_cipher = WIFI_CIPHER_TYPE_CCMP;
+            } else if has_tkip {
+                data.pairwise_cipher = WIFI_CIPHER_TYPE_TKIP;
+            }
+        }
+        return 0;
+    }
+
+    return -1;
+}
+
+@used
+fn wifi_wpa2_reset() {
+    s_in_4way = false;
+    s_ptk_installed = false;
+    s_waiting_m4_txdone = false;
+    s_pending_ptk_install = false;
+    s_has_pending_gtk = false;
+}
+
+fn install_gtk_now(gtk: u8*, gtk_len: usize, key_idx: u8, rsc: u8*) {
+    let alg: i32 = WIFI_WPA_ALG_CCMP;
+    if gtk_len == 32 {
+        alg = WIFI_WPA_ALG_TKIP;
+    }
+    let seq: u8[8];
+    mem_zero(&seq[0], 8);
+    mem_copy(&seq[0], rsc, 6);
+
+    let key_buf: u8[32];
+    if gtk_len > 32 {
+        return;
+    }
+    mem_copy(&key_buf[0], gtk, gtk_len);
+    if alg == WIFI_WPA_ALG_TKIP && gtk_len == 32 {
+        // IEEE 802.11i GTK KDE stores [16..23]=Auth TX (STA RX), [24..31]=Auth RX (STA TX);
+        // net80211 expects [16..23]=TX Michael key, [24..31]=RX Michael key.
+        let tmp: u8[8];
+        mem_copy(&tmp[0], &key_buf[16], 8);
+        mem_copy(&key_buf[16], &key_buf[24], 8);
+        mem_copy(&key_buf[24], &tmp[0], 8);
+    }
+
+    let _rc: i32 = esp_wifi_set_sta_key_internal(alg, &s_ap_bssid[0], (i32)key_idx, 0,
+                                                 &seq[0], 6, &key_buf[0], gtk_len,
+                                                 KEY_FLAG_GROUP | KEY_FLAG_RX);
+}
+
+fn wifi_wpa2_eapol_txcb(eapol_payload: u8*, len: usize, tx_failure: bool) {
+    if !s_waiting_m4_txdone || eapol_payload == (u8*)0 || len < 99 {
+        return;
+    }
+    if eapol_payload[1] != 0x03 {
+        return; // Only EAPOL-Key
+    }
+
+    let key: u8* = &eapol_payload[4];
+    let key_info: u16 = ((u16)key[1] << 8) | (u16)key[2];
+    let kd_len: u16   = ((u16)key[93] << 8) | (u16)key[94];
+
+    // Confirm TX-done notification is for 4-Way Handshake Message 4/4 (Secure=1, KeyDataLen=0)
+    if kd_len != 0 && (key_info & (1 << 9)) == 0 {
+        return;
+    }
+
+    if tx_failure {
+        bsp_uart_puts("[wpa2] EAPOL 4/4 TX failed, awaiting AP retry\n");
+        return;
+    }
+
+    s_waiting_m4_txdone = false;
+
+    // Install Pairwise Key (PTK TK = s_ptk[32..47], 16B AES-CCMP) AFTER Msg 4/4 was sent unencrypted
+    if s_pending_ptk_install && !s_ptk_installed {
+        let zero_seq: u8[8];
+        mem_zero(&zero_seq[0], 8);
+        let _rc: i32 = esp_wifi_set_sta_key_internal(WIFI_WPA_ALG_CCMP, &s_ap_bssid[0], 0, 1,
+                                                     &zero_seq[0], 6, &s_ptk[32], 16,
+                                                     KEY_FLAG_PAIRWISE | KEY_FLAG_RX | KEY_FLAG_TX);
+        s_ptk_installed = true;
+    }
+
+    // Install Group Key (GTK) unwrapped from Msg 3/4
+    if s_has_pending_gtk {
+        install_gtk_now(&s_pending_gtk[0], s_pending_gtk_len, s_pending_gtk_idx, &s_pending_gtk_rsc[0]);
+        s_has_pending_gtk = false;
+    }
+
+    s_in_4way = false;
+    bsp_uart_puts("[wpa2] 4-way handshake complete (PTK+GTK installed)\n");
+    let _ok: bool = esp_wifi_auth_done_internal();
+}
+
+@used
+fn wifi_wpa2_sta_init() -> bool {
+    wifi_wpa2_reset();
+    let cb_ptr: void* = (void*)0;
+    raw { cb_ptr = (void *)wifi_wpa2_eapol_txcb; }
+    return esp_wifi_register_eapol_txdonecb_internal(cb_ptr) == 0;
+}
+
+@used
+fn wifi_wpa2_sta_deinit() -> bool {
+    let _rc: i32 = esp_wifi_register_eapol_txdonecb_internal((void*)0);
+    wifi_wpa2_reset();
+    return true;
+}
+
+@used
+fn wifi_wpa2_sta_connect(bssid: u8*) -> i32 {
+    if bssid == (u8*)0 {
+        return -1;
+    }
+    mem_copy(&s_ap_bssid[0], bssid, 6);
+    wifi_drv_read_mac(&s_sta_mac[0]);
+    wifi_wpa2_reset();
+
+    let ssid_p: WifiSsidCompat* = esp_wifi_sta_get_prof_ssid_internal();
+    let pass_p: u8* = esp_wifi_sta_get_prof_password_internal();
+    let pass: char* = "";
+    if pass_p != (u8*)0 {
+        pass = (char*)pass_p;
+    }
+
+    if pass[0] != '\0' && ssid_p != (WifiSsidCompat*)0 && ssid_p.len > 0 {
+        let slen: usize = (usize)ssid_p.len;
+        if slen > 32 {
+            slen = 32;
+        }
+        let plen: usize = str_len(pass);
+        if plen > 64 {
+            plen = 64;
+        }
+
+        let need_pmk: bool = true;
+        if s_pmk_valid &&
+           str_len(&s_cached_ssid[0]) == slen &&
+           mem_cmp((u8*)&s_cached_ssid[0], &ssid_p.ssid[0], slen) == 0 &&
+           str_len(&s_cached_pass[0]) == plen &&
+           mem_cmp((u8*)&s_cached_pass[0], (u8*)pass, plen) == 0 {
+            need_pmk = false;
+        }
+
+        if need_pmk {
+            if !(plen == 64 && try_parse_hex_pmk(pass, &s_pmk[0])) {
+                wpa2_pbkdf2_sha1(pass, &ssid_p.ssid[0], slen, 4096, &s_pmk[0], 32);
+            }
+            mem_copy((u8*)&s_cached_ssid[0], &ssid_p.ssid[0], slen);
+            s_cached_ssid[slen] = '\0';
+            mem_copy((u8*)&s_cached_pass[0], (u8*)pass, plen);
+            s_cached_pass[plen] = '\0';
+            s_pmk_valid = true;
+        }
+
+        let grp_c: u8 = esp_wifi_sta_get_group_cipher_internal();
+        let pw_c: u8  = esp_wifi_sta_get_pairwise_cipher_internal();
+        let grp_suite: u8 = 0x04;
+        if grp_c == NET80211_CIPHER_TKIP {
+            grp_suite = (u8)0x02;
+        }
+        let pw_suite: u8 = 0x04;
+        if pw_c == NET80211_CIPHER_TKIP {
+            pw_suite = (u8)0x02;
+        }
+
+        bsp_uart_puts("[wpa2] Associating with ");
+        wpa2_put_mac(bssid);
+        bsp_uart_puts(" (pw=");
+        if pw_suite == 0x02 { bsp_uart_puts("TKIP"); } else { bsp_uart_puts("CCMP"); }
+        bsp_uart_puts(" grp=");
+        if grp_suite == 0x02 { bsp_uart_puts("TKIP"); } else { bsp_uart_puts("CCMP"); }
+        bsp_uart_puts(")...\n");
+
+        if esp_wifi_sta_prof_is_wpa_internal() && !esp_wifi_sta_prof_is_rsn_internal() {
+            mem_copy(&s_assoc_ie[0], &s_wpa1_ie_tmpl[0], 24);
+            s_assoc_ie[11] = grp_suite;
+            s_assoc_ie[17] = pw_suite;
+            s_assoc_ie_len = (u16)24;
+            let _r1: i32 = esp_wifi_set_appie_internal(WIFI_APPIE_RSN, (u8*)0, (u16)0, (u8)0);
+            let _r2: i32 = esp_wifi_set_appie_internal(WIFI_APPIE_WPA, &s_assoc_ie[0], s_assoc_ie_len, (u8)0);
+        } else {
+            mem_copy(&s_assoc_ie[0], &s_rsn_ie_tmpl[0], 22);
+            s_assoc_ie[7]  = grp_suite;
+            s_assoc_ie[13] = pw_suite;
+            s_assoc_ie_len = (u16)22;
+            let _r1: i32 = esp_wifi_set_appie_internal(WIFI_APPIE_WPA, (u8*)0, (u16)0, (u8)0);
+            let _r2: i32 = esp_wifi_set_appie_internal(WIFI_APPIE_RSN, &s_assoc_ie[0], s_assoc_ie_len, (u8)0);
+        }
+    } else {
+        bsp_uart_puts("[wpa2] Associating with ");
+        wpa2_put_mac(bssid);
+        bsp_uart_puts(" (OPEN)...\n");
+        s_assoc_ie_len = (u16)0;
+        let _r1: i32 = esp_wifi_set_appie_internal(WIFI_APPIE_WPA, (u8*)0, (u16)0, (u8)0);
+        let _r2: i32 = esp_wifi_set_appie_internal(WIFI_APPIE_RSN, (u8*)0, (u16)0, (u8)0);
+    }
+
+    return esp_wifi_sta_connect_internal(bssid);
+}
+
+@used
+fn wifi_wpa2_sta_connected(bssid: u8*) {
+    if bssid != (u8*)0 {
+        mem_copy(&s_ap_bssid[0], bssid, 6);
+    }
+    s_in_4way = false;
+}
+
+@used
+fn wifi_wpa2_sta_disconnected(_reason_code: u8) {
+    wifi_wpa2_reset();
+}
+
+@used
+fn wifi_wpa2_sta_in_4way() -> bool {
+    return s_in_4way;
+}
+
+fn derive_ptk(anonce: u8*, snonce: u8*, ptk_out: u8*) {
+    let data: u8[76];
+    if mem_cmp(&s_sta_mac[0], &s_ap_bssid[0], 6) < 0 {
+        mem_copy(&data[0], &s_sta_mac[0], 6);
+        mem_copy(&data[6], &s_ap_bssid[0], 6);
+    } else {
+        mem_copy(&data[0], &s_ap_bssid[0], 6);
+        mem_copy(&data[6], &s_sta_mac[0], 6);
+    }
+    if mem_cmp(snonce, anonce, 32) < 0 {
+        mem_copy(&data[12], snonce, 32);
+        mem_copy(&data[44], anonce, 32);
+    } else {
+        mem_copy(&data[12], anonce, 32);
+        mem_copy(&data[44], snonce, 32);
+    }
+    wpa2_prf_384(&s_pmk[0], "Pairwise key expansion", &data[0], 76, ptk_out);
+}
+
+fn send_eapol_key_reply(desc_type: u8, replay_cnt: u8*, snonce: u8*,
+                        key_info: u16, key_data: u8*, key_data_len: u16) {
+    let frame: u8[160];
+    let body_len: u16  = (u16)(95 + (u32)key_data_len);
+    let total_len: u16 = (u16)(14 + 4 + (u32)body_len);
+    if total_len > 160 {
+        return;
+    }
+    mem_zero(&frame[0], (usize)total_len);
+
+    // Ethernet II header: Dst=BSSID, Src=STA_MAC, EtherType=0x888E (EAPOL)
+    mem_copy(&frame[0], &s_ap_bssid[0], 6);
+    mem_copy(&frame[6], &s_sta_mac[0], 6);
+    frame[12] = (u8)0x88;
+    frame[13] = (u8)0x8E;
+
+    let eapol: u8* = &frame[14];
+    eapol[0] = (u8)0x01; // 802.1X-2001 version
+    eapol[1] = (u8)0x03; // EAPOL-Key
+    eapol[2] = (u8)(body_len >> 8);
+    eapol[3] = (u8)(body_len & 0xFF);
+
+    let key: u8* = &eapol[4];
+    key[0] = desc_type; // 0x02 = RSN, 0xFE = WPA1
+    key[1] = (u8)(key_info >> 8);
+    key[2] = (u8)(key_info & 0xFF);
+    mem_copy(&key[5], replay_cnt, 8);
+    if snonce != (u8*)0 {
+        mem_copy(&key[13], snonce, 32);
+    }
+    key[93] = (u8)(key_data_len >> 8);
+    key[94] = (u8)(key_data_len & 0xFF);
+    if key_data != (u8*)0 && key_data_len > 0 {
+        mem_copy(&key[95], key_data, (usize)key_data_len);
+    }
+
+    // Compute HMAC-SHA1-128 MIC over entire EAPOL frame (MIC field zeroed at key[77..92])
+    let mic: u8[20];
+    wpa2_hmac_sha1(&s_ptk[0], 16, eapol, (usize)(4 + (u32)body_len), &mic[0]);
+    mem_copy(&key[77], &mic[0], 16);
+
+    let _rc: i32 = esp_wifi_internal_tx(WIFI_IF_STA, (void*)&frame[0], total_len);
+}
+
+fn verify_eapol_mic(eapol: u8*, eapol_len: usize) -> bool {
+    if eapol_len < 99 || eapol_len > 512 {
+        return false;
+    }
+    let tmp: u8[512];
+    mem_copy(&tmp[0], eapol, eapol_len);
+    mem_zero(&tmp[4 + 77], 16);
+    let calc: u8[20];
+    wpa2_hmac_sha1(&s_ptk[0], 16, &tmp[0], eapol_len, &calc[0]);
+    return mem_cmp(&calc[0], &eapol[4 + 77], 16) == 0;
+}
+
+fn extract_gtk_kde(kde_buf: u8*, kde_len: usize,
+                   out_gtk: u8*, out_len: usize*, out_idx: u8*) -> bool {
+    let pos: usize = 0;
+    while pos + 2 <= kde_len {
+        let id: u8   = kde_buf[pos];
+        let elen: u8 = kde_buf[pos + 1];
+        if id == 0xDD && elen == 0 {
+            break; // Padding
+        }
+        if pos + 2 + (usize)elen > kde_len {
+            break;
+        }
+        // IEEE 802.11i GTK KDE: 0xDD, len >= 22, OUI 00-0F-AC, Type 01
+        if id == 0xDD && elen >= 22 &&
+           kde_buf[pos + 2] == 0x00 && kde_buf[pos + 3] == 0x0F &&
+           kde_buf[pos + 4] == 0xAC && kde_buf[pos + 5] == 0x01 {
+            let glen: usize = (usize)(elen - 6);
+            if glen <= 32 {
+                *out_idx = kde_buf[pos + 6] & 0x03;
+                *out_len = glen;
+                mem_copy(out_gtk, &kde_buf[pos + 8], glen);
+                return true;
+            }
+        }
+        pos = pos + 2 + (usize)elen;
+    }
+    return false;
+}
+
+@used
+fn wifi_wpa2_sta_rx_eapol(_src_addr: u8*, buf: u8*, len: u32) -> i32 {
+    if buf == (u8*)0 || len < 99 || !s_pmk_valid {
+        return -1;
+    }
+    if buf[1] != 0x03 {
+        return 0; // Only EAPOL-Key
+    }
+
+    let body_len: u16 = ((u16)buf[2] << 8) | (u16)buf[3];
+    if (4 + (u32)body_len) > len || body_len < 95 {
+        return -1;
+    }
+
+    let key: u8* = &buf[4];
+    let desc_type: u8 = key[0];
+    if desc_type != 0x02 && desc_type != 0xFE {
+        return 0; // RSN (2) or WPA1 (254)
+    }
+
+    let key_info: u16 = ((u16)key[1] << 8) | (u16)key[2];
+    let key_ver: u16  = key_info & 0x0007;
+    let pairwise: bool = (key_info & (1 << 3)) != 0;
+    let install: bool  = (key_info & (1 << 6)) != 0;
+    let ack: bool      = (key_info & (1 << 7)) != 0;
+    let mic_flag: bool = (key_info & (1 << 8)) != 0;
+    let secure: bool   = (key_info & (1 << 9)) != 0;
+    let enc_data: bool = (key_info & (1 << 12)) != 0;
+
+    let replay: u8* = &key[5];
+    let anonce: u8* = &key[13];
+    let rsc: u8*    = &key[61];
+    let kd_len: u16 = ((u16)key[93] << 8) | (u16)key[94];
+    let kd: u8*     = &key[95];
+    if (95 + (u32)kd_len) > (u32)body_len {
+        return -1;
+    }
+
+    // 1. 4-Way Handshake Message 1: Pairwise=1, Ack=1, MIC=0
+    if pairwise && ack && !mic_flag {
+        s_in_4way = true;
+        s_waiting_m4_txdone = false;
+        fill_random_bytes(&s_snonce[0], 32);
+        derive_ptk(anonce, &s_snonce[0], &s_ptk[0]);
+        let m2_info: u16 = (u16)((u32)key_ver | (1 << 3) | (1 << 8));
+        send_eapol_key_reply(desc_type, replay, &s_snonce[0], m2_info, &s_assoc_ie[0], s_assoc_ie_len);
+        bsp_uart_puts("[wpa2] EAPOL 1/4 -> 2/4 sent\n");
+        return 0;
+    }
+
+    // 2. 4-Way Handshake Message 3: Pairwise=1, Ack=1, MIC=1
+    if pairwise && ack && mic_flag {
+        if !verify_eapol_mic(buf, (usize)(4 + (u32)body_len)) {
+            bsp_uart_puts("[wpa2] EAPOL 3/4 MIC mismatch (check Wi-Fi password)\n");
+            return -1;
+        }
+
+        s_pending_ptk_install = install;
+        s_has_pending_gtk = false;
+
+        // Unwrap Encrypted Key Data (RFC 3394 AES-128 Key Unwrap) and stage GTK for txdone install
+        if enc_data && kd_len >= 24 && (kd_len & 7) == 0 && kd_len <= 256 {
+            let plain: u8[256];
+            let n_blocks: usize = (usize)(kd_len / 8) - 1;
+            if wpa2_aes_unwrap(&s_ptk[16], n_blocks, kd, &plain[0]) == 0 {
+                if extract_gtk_kde(&plain[0], n_blocks * 8,
+                                   &s_pending_gtk[0], &s_pending_gtk_len, &s_pending_gtk_idx) {
+                    mem_copy(&s_pending_gtk_rsc[0], rsc, 6);
+                    s_has_pending_gtk = true;
+                }
+            }
+        }
+
+        // Mark waiting BEFORE esp_wifi_internal_tx so TX-done cannot race ahead
+        s_waiting_m4_txdone = true;
+        let sec_bit: u32 = 0;
+        if secure {
+            sec_bit = (1 << 9);
+        }
+        let m4_info: u16 = (u16)((u32)key_ver | (1 << 3) | (1 << 8) | sec_bit);
+        send_eapol_key_reply(desc_type, replay, (u8*)0, m4_info, (u8*)0, (u16)0);
+        bsp_uart_puts("[wpa2] EAPOL 3/4 -> 4/4 sent\n");
+        return 0;
+    }
+
+    // 3. Group Key Handshake Message 1 (GTK rekey): Pairwise=0, Ack=1, MIC=1, Secure=1
+    if !pairwise && ack && mic_flag && secure && s_ptk_installed {
+        if !verify_eapol_mic(buf, (usize)(4 + (u32)body_len)) {
+            return -1;
+        }
+        if enc_data && kd_len >= 24 && (kd_len & 7) == 0 && kd_len <= 256 {
+            let plain: u8[256];
+            let n_blocks: usize = (usize)(kd_len / 8) - 1;
+            let gtk: u8[32];
+            let gtk_len: usize = 0;
+            let gtk_idx: u8 = 0;
+            if wpa2_aes_unwrap(&s_ptk[16], n_blocks, kd, &plain[0]) == 0 &&
+               extract_gtk_kde(&plain[0], n_blocks * 8, &gtk[0], &gtk_len, &gtk_idx) {
+                install_gtk_now(&gtk[0], gtk_len, gtk_idx, rsc);
+            }
+        }
+        let gm2_info: u16 = (u16)((u32)key_ver | (1 << 8) | (1 << 9));
+        send_eapol_key_reply(desc_type, replay, (u8*)0, gm2_info, (u8*)0, (u16)0);
+        return 0;
+    }
+
+    return 0;
+}
